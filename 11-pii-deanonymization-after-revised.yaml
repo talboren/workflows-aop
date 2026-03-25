@@ -1,0 +1,95 @@
+# =============================================================================
+# 11b — PII De-anonymization: After Inference (Revised — Trigger Chaining)
+# =============================================================================
+# Use case: Runs after the LLM responds. Receives the token map as input
+#           (passed by the caller from the before-inference output), scans
+#           the LLM response for tokens, and restores the original values.
+#
+# Paired with: 11-pii-anonymization-before-revised.yaml
+#
+# Changes from original (03-pii-anonymization-after.yaml):
+#   - No sync: true on trigger (inherited from trigger definition)
+#   - No event.mutate (by-ref is architecturally impossible — ES serialization)
+#   - No state.ephemeral.get (token map arrives as event.tokenMap input)
+#   - No state.ephemeral.delete (nothing to clean up)
+#   - No shared key convention ("pii_map:{{ event.roundId }}")
+#   - Each workflow is independently testable with mock inputs
+#
+# Trigger registration (by AB team):
+#   workflowsExtensions.registerTriggerDefinition({
+#     id: 'agent-builder.afterInference',
+#     eventSchema: z.object({
+#       response: z.string(),
+#       tokenMap: z.record(z.string(), z.object({
+#         original: z.string(),
+#         entity: z.string(),
+#       })),
+#       agentId: z.string().optional(),
+#     }),
+#     sync: {
+#       outputSchema: z.object({
+#         response: z.string(),
+#       }),
+#       maxTimeout: '10s',
+#       failurePolicy: 'open',
+#     },
+#   });
+#
+# Caller usage:
+#   const { output } = await workflowsClient.invokeEvent(
+#     'agent-builder.afterInference',
+#     { response: llmResponse, tokenMap, agentId }
+#   );
+#   const restoredResponse = output.response;
+# =============================================================================
+
+version: '1'
+name: PII De-anonymization — After Inference
+description: >
+  Post-inference step that restores original PII values in the LLM's
+  response using the token map provided by the caller. No ephemeral
+  state access needed — the token map is passed as input.
+enabled: true
+tags:
+  - anonymization
+  - pii
+  - agent-builder
+
+triggers:
+  - type: agent-builder.afterInference
+
+outputs:
+  type: object
+  properties:
+    response:
+      type: string
+      description: The response with original PII values restored
+
+steps:
+  # Step 1: Check if there's anything to de-anonymize
+  # [EXISTS] if — standard flow control
+  - name: check_has_tokens
+    type: if
+    condition: "event.tokenMap : *"
+    steps:
+      # Step 2: Scan the LLM response for tokens and swap originals back in
+      # [PROPOSED STEP] transform.pii_restore — for each key in the token map
+      # found in the response text, replaces the token with the original value
+      - name: deanonymise
+        type: transform.pii_restore
+        with:
+          input: "{{ event.response }}"
+          token_map: "{{ event.tokenMap }}"
+
+      # Step 3: Return the restored response
+      # [EXISTS] workflow.output
+      - name: return_restored
+        type: workflow.output
+        with:
+          response: "{{ steps.deanonymise.output.restored_text }}"
+    else:
+      # No token map or empty — return response unchanged
+      - name: return_unchanged
+        type: workflow.output
+        with:
+          response: "{{ event.response }}"
