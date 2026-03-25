@@ -1,0 +1,106 @@
+# =============================================================================
+# 11a — PII Anonymization: Before Inference (Revised — Trigger Chaining)
+# =============================================================================
+# Use case: Runs before the LLM sees the user's message. Detects PII,
+#           replaces each value with a deterministic token, and returns
+#           the anonymized message + token map via workflow.output.
+#           The caller passes the token map to the after-inference workflow.
+#
+# Paired with: 11-pii-deanonymization-after-revised.yaml
+#
+# Changes from original (02-pii-anonymization-before.yaml):
+#   - No sync: true on trigger (inherited from trigger definition)
+#   - No event.mutate (by-ref is architecturally impossible — ES serialization)
+#   - No state.ephemeral.set (token map returned via workflow.output instead)
+#   - outputs declaration matches trigger's outputSchema
+#   - Security: token map stays in caller's scope, not in globally-accessible store
+#
+# Trigger registration (by AB team):
+#   workflowsExtensions.registerTriggerDefinition({
+#     id: 'agent-builder.beforeInference',
+#     eventSchema: z.object({
+#       message: z.string(),
+#       agentId: z.string().optional(),
+#     }),
+#     sync: {
+#       outputSchema: z.object({
+#         message: z.string(),
+#         tokenMap: z.record(z.string(), z.object({
+#           original: z.string(),
+#           entity: z.string(),
+#         })),
+#       }),
+#       maxTimeout: '10s',
+#       failurePolicy: 'open',
+#     },
+#   });
+#
+# Caller usage:
+#   const { output } = await workflowsClient.invokeEvent(
+#     'agent-builder.beforeInference', { message: userMessage, agentId }
+#   );
+#   const anonymizedPrompt = output.message;
+#   const tokenMap = output.tokenMap;  // held in local memory for Phase 3
+# =============================================================================
+
+version: '1'
+name: PII Anonymization — Before Inference
+description: >
+  Pre-inference guardrail that detects PII in the user message,
+  replaces each value with a deterministic HMAC-SHA256 token,
+  and returns the anonymized message along with the token map.
+  The caller passes the token map to the after-inference workflow.
+enabled: true
+tags:
+  - anonymization
+  - pii
+  - agent-builder
+
+triggers:
+  - type: agent-builder.beforeInference
+
+outputs:
+  type: object
+  properties:
+    message:
+      type: string
+      description: The anonymized message with PII replaced by tokens
+    tokenMap:
+      type: object
+      description: >
+        Map of token to original value and entity type.
+        Example: { "<tok_abc>": { "original": "555-12-3456", "entity": "US_SSN" } }
+        Empty object if no PII was found.
+
+steps:
+  # Step 1: Detect PII and replace with deterministic tokens
+  # [PROPOSED STEP] ai.pii — scans text for PII entities, replaces each with
+  # a deterministic HMAC-SHA256 token. Produces:
+  #   - anonymised_text: the message with tokens substituted in
+  #   - token_map: { "<token>": { "original": "...", "entity": "EMAIL_ADDRESS" }, ... }
+  - name: anonymise
+    type: ai.pii
+    with:
+      input: "{{ event.message }}"
+      entities:
+        - EMAIL_ADDRESS
+        - US_SSN
+        - CREDIT_CARD
+        - PHONE_NUMBER
+        - IP_ADDRESS
+        - PERSON_NAME
+      action: replace
+      replace_strategy: hmac_sha256
+      hmac_secret: "{{ consts.pii_hmac_key }}"
+
+  # Step 2: Return both the anonymized text and the token map
+  # [EXISTS] workflow.output — the caller receives these via invokeEvent result.
+  # No state.ephemeral needed — the token map flows through the caller.
+  - name: return_result
+    type: workflow.output
+    with:
+      message: "{{ steps.anonymise.output.anonymised_text }}"
+      tokenMap: "{{ steps.anonymise.output.token_map }}"
+
+consts:
+  pii_hmac_key: "REDACTED"
