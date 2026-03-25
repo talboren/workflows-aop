@@ -87,6 +87,7 @@ Teams register custom trigger types via `registerTriggerDefinition()` in their p
 | `06-alert-enrichment.yaml` | Alert enrichment with AI summary | Async event-driven | No |
 | `07-cases-guardrail.yaml` | PII blocking on case comments | `workflow.fail` for blocking | Yes |
 | `08-sync-workflow-guardrails.md` | Guardrails for sync workflows | Timeout, circuit breaker, fail-open | — |
+| `09-naming-and-trigger-mode-proposal.md` | API naming & trigger-level mode | Discussion: `emitEvent` → `triggerWorkflows`, `sync: true` → trigger-level `mode` | — |
 
 ## Architecture
 
