@@ -31,26 +31,17 @@ workflowsExtensions.registerTriggerDefinition({
 });
 
 // ── Hook 2: Before Inference (PII Anonymization) ────────────────────────────
-// Runs before the LLM sees the message and attachments. Workflows subscribing
-// to this hook use the ai.pii step, which delegates to the inference plugin's
-// anonymization pipeline (already available on main behind xpack.anonymization.active).
-// The step returns anonymized content and a replacementsId the caller stores on
-// the Conversation. On subsequent turns, the caller passes the existing
+// Runs before the LLM sees the message. Workflows subscribing to this hook use
+// the ai.pii step, which delegates to the inference plugin's anonymization
+// pipeline (already available on main behind xpack.anonymization.active).
+// The step returns the anonymized message and a replacementsId the caller stores
+// on the Conversation. On subsequent turns, the caller passes the existing
 // replacementsId back so the same tokens are reused — keeping the LLM context
 // consistent across turns.
-//
-// Attachments are typed as a generic passthrough — Agent Builder does not know
-// or care about domain-specific shapes (alerts, log events, etc.). The consuming
-// team (e.g. Security Solution) holds the typed schema on their side and passes
-// the object in. Field-level anonymization rules are declared in the workflow
-// YAML via field_rules, not inferred from the attachment type at runtime.
 workflowsExtensions.registerTriggerDefinition({
   id: 'agent-builder.beforeInference',
   eventSchema: z.object({
     message: z.string().describe('The raw user message to anonymize'),
-    attachments: z.array(
-      z.object({ type: z.string() }).passthrough()
-    ).optional().describe('Domain-specific attachments — shape is opaque to Agent Builder'),
     agentId: z.string().optional().describe('The agent handling this round'),
     conversationId: z.string().optional().describe('Conversation ID for logging and context'),
     replacementsId: z.string().optional().describe(
@@ -62,9 +53,6 @@ workflowsExtensions.registerTriggerDefinition({
   sync: {
     outputSchema: z.object({
       message: z.string().describe('The anonymized message with PII replaced by tokens'),
-      attachments: z.array(
-        z.object({ type: z.string() }).passthrough()
-      ).optional().describe('The anonymized attachments — same structure, PII fields replaced'),
       replacementsId: z.string().optional().describe(
         'ID of the token map persisted to ES. ' +
         'The caller stores this on the Conversation and passes it back on the next turn.'
@@ -199,16 +187,15 @@ if (result.status === 'failed') {
 version: '1'
 name: PII Anonymization — Before Inference
 description: >
-  Pre-inference hook that anonymizes the user message and attachments before
-  they reach the LLM. The ai.pii step delegates to the inference plugin's
-  existing anonymization pipeline (PII detection via regex and NER, HMAC-SHA256
-  token generation, replacements storage via ReplacementsRepository) — the same
-  pipeline that runs automatically inside chatComplete when xpack.anonymization.active
-  is enabled. Exposing it as a workflow step makes the behaviour user-configurable:
-  field rules, entity types, and tool deanonymization policy live in the YAML
-  rather than being hardcoded. On subsequent turns the existing map is extended
-  so the same entity always maps to the same token, keeping the LLM context
-  stable across turns.
+  Pre-inference hook that anonymizes the user message before it reaches the LLM.
+  The ai.pii step delegates to the inference plugin's existing anonymization
+  pipeline (PII detection via regex and NER, HMAC-SHA256 token generation,
+  replacements storage via ReplacementsRepository) — the same pipeline that runs
+  automatically inside chatComplete when xpack.anonymization.active is enabled.
+  Exposing it as a workflow step makes the behaviour user-configurable: entity
+  types and tool deanonymization policy live in the YAML rather than being
+  hardcoded. On subsequent turns the existing map is extended so the same entity
+  always maps to the same token, keeping the LLM context stable across turns.
 enabled: true
 tags:
   - anonymization
@@ -224,11 +211,6 @@ outputs:
     message:
       type: string
       description: The anonymized message with PII replaced by tokens
-    attachments:
-      type: array
-      description: >
-        The anonymized attachments — same structure as input, PII fields
-        replaced by tokens according to the field_rules declared below.
     replacementsId:
       type: string
       description: >
@@ -236,18 +218,14 @@ outputs:
         Conversation and passes it back on the next turn.
 
 steps:
-  # [PROPOSED STEP] ai.pii — scans message text and attachment fields for PII,
-  # replaces with HMAC tokens, and always persists the token map to ES via the
-  # inference plugin's ReplacementsRepository (.kibana-anonymization-replacements).
+  # [PROPOSED STEP] ai.pii — scans the message text for PII, replaces with HMAC
+  # tokens, and always persists the token map to ES via the inference plugin's
+  # ReplacementsRepository (.kibana-anonymization-replacements).
   # Persistence is unconditional — it is required for multi-turn consistency,
   # page refresh recovery, distributed execution, and tool deanonymization.
   # - replacements_id (optional): if present, loads the existing map from ES and
   #   extends it with any new PII found this turn, so the same entity always maps
   #   to the same token across the conversation.
-  # - field_rules: declares which attachment fields to anonymize and how.
-  #   The step does not infer field names from the attachment type — the workflow
-  #   author specifies them explicitly. Domain knowledge (which fields are
-  #   sensitive) lives here in the YAML.
   # - tool_deanonymization: controls whether and how the internal beforeToolCall
   #   hook is allowed to swap tokens back to real values before a tool executes.
   #   This is the workflow-configurable surface for tool-level deanonymization —
@@ -256,7 +234,6 @@ steps:
     type: ai.pii                             # [PROPOSED STEP]
     with:
       input: "{{ event.message }}"
-      attachments: "{{ event.attachments }}"
       replacements_id: "{{ event.replacementsId }}"
       entities:
         - EMAIL_ADDRESS
@@ -268,17 +245,6 @@ steps:
       action: replace
       replace_strategy: hmac_sha256
       hmac_secret: "{{ consts.pii_hmac_key }}"
-      # field_rules: per-field policy for typed attachment fields.
-      # Defined by the workflow author — example for a Security Solution alert:
-      field_rules:
-        - field: hostName
-          anonymized: true
-        - field: userName
-          anonymized: true
-        - field: sourceIp
-          anonymized: true
-        - field: ruleName
-          anonymized: false   # pass through — useful context for the LLM
       # tool_deanonymization: governs the internal beforeToolCall hook.
       # The workflow author decides which tools are trusted to receive real values.
       # 'allowlist' — only listed tool_ids receive real values; all others see tokens.
@@ -292,14 +258,13 @@ steps:
         tool_ids:
           - 'security.entity_analytics.risk_score'
 
-  # Return the anonymized content and the ES token map ID.
+  # Return the anonymized message and the ES token map ID.
   # The caller stores replacementsId on the Conversation and threads it into
   # agentRunner.run() so beforeToolCall / afterToolCall hooks can access it.
   - name: return_result
     type: workflow.output                    # [EXISTS]
     with:
       message: "{{ steps.anonymise.output.anonymised_text }}"
-      attachments: "{{ steps.anonymise.output.anonymised_attachments }}"
       replacementsId: "{{ steps.anonymise.output.replacements_id }}"
 
 consts:
@@ -371,11 +336,8 @@ The PII anonymization flow uses `replacementsId` to thread the token map across 
 ```typescript
 // x-pack/platform/plugins/shared/agent_builder/server/services/agents/run_inference.ts
 
-// `attachments` is typed by the consuming team (e.g. Security Solution),
-// not by Agent Builder. Agent Builder passes it through opaquely.
 export async function runInferenceWithPiiProtection({
   prompt,
-  attachments,
   agentId,
   conversationId,
   existingReplacementsId,   // loaded from Conversation before this call
@@ -389,7 +351,6 @@ export async function runInferenceWithPiiProtection({
   // The step extends the existing map so tokens remain stable across turns.
   const anonResult = await workflowsClient.invokeHook('agent-builder.beforeInference', {
     message: prompt,
-    attachments,
     agentId,
     conversationId,
     replacementsId: existingReplacementsId,
@@ -397,7 +358,6 @@ export async function runInferenceWithPiiProtection({
 
   // failurePolicy: 'open' → if anonymization fails, proceed with original
   const anonymizedPrompt = anonResult.output?.message ?? prompt;
-  const anonymizedAttachments = anonResult.output?.attachments ?? attachments;
   const replacementsId = anonResult.output?.replacementsId ?? existingReplacementsId;
 
   if (anonResult.status === 'failed') {
@@ -415,7 +375,6 @@ export async function runInferenceWithPiiProtection({
   // results mid-turn without going through the workflow engine.
   const llmResponse = await agentRunner.run({
     message: anonymizedPrompt,
-    attachments: anonymizedAttachments,
     replacementsId,
   });
 

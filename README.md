@@ -387,7 +387,7 @@ Each guide contains trigger registrations, workflow YAML examples, and caller co
 
 | Guide | Lifecycle hooks | Key patterns |
 |-------|----------------|--------------|
-| [**Agent Builder**](./agent-builder.md) | `beforeChatRound` (guardrails), `beforeInference` / `afterInference` (PII anonymization) | `replacementsId` for multi-turn token map persistence, generic attachment passthrough with `field_rules`, internal tool lifecycle hooks (`beforeToolCall`/`afterToolCall`), guardrail with `workflow.fail`, migration from `BeforeAgentWorkflowOutput` |
+| [**Agent Builder**](./agent-builder.md) | `beforeChatRound` (guardrails), `beforeInference` / `afterInference` (PII anonymization) | `replacementsId` for multi-turn token map persistence, internal tool lifecycle hooks (`beforeToolCall`/`afterToolCall`) with `tool_deanonymization` allowlist, guardrail with `workflow.fail`, migration from `BeforeAgentWorkflowOutput` |
 | [**Dashboards**](./dashboards.md) | `beforeCreate` (PII reduction) | Implicit output (input = output schema), `data.regexReplace` |
 | [**Cases**](./cases.md) | `beforeCreate`, `beforeComment` (PII guardrail) | `ai.guardrail` step, `workflow.fail` for blocking |
 
