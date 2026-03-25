@@ -1,168 +1,302 @@
-# Workflow Examples & Snippets — Design Validation
+# Workflow-Driven Cross-Cutting Concerns
 
-> **Purpose**: These are *proposal* examples for team review, not production code. They demonstrate how workflows can be used for guardrails, anonymization, PII reduction, and other cross-cutting concerns across Kibana systems (Agent Builder, Dashboards, Cases, etc.). The goal is to stress-test the workflow architecture before writing implementation code.
+> **Purpose**: Design proposal for extending Kibana's workflow engine to support **event-driven triggers** and **lifecycle hooks** — a unified model that lets teams like Agent Builder, Dashboards, and Cases delegate cross-cutting concerns (guardrails, PII reduction, enrichment) to user-authored or system workflows.
 
-## Legend
+## Proposed Design Decisions
 
-Throughout the YAML examples, comments indicate what exists today vs. what is proposed:
+The following decisions are reflected throughout the examples:
 
-- `# [EXISTS]` — This syntax/feature works today in the workflow engine
-- `# [PROPOSED]` — This syntax/feature does not exist yet and is part of the design proposal
-- `# [PROPOSED STEP]` — A new step type that would need to be implemented
+| Decision | Summary |
+|----------|---------|
+| **Lifecycle Hooks** | Blocking (synchronous) workflows are called *lifecycle hooks*. They run inline before an operation completes. |
+| **Two APIs** | `emitEvent()` for async fire-and-forget; `invokeHook()` for sync lifecycle participation. Registration uses the same `registerTriggerDefinition()` for both. |
+| **Always by-value** | No by-ref mutation. The trigger definition owns the `outputSchema`. Workflows return data via explicit `workflow.output` or implicitly when input and output schemas match. |
+| **Trigger-level mode** | The team registering the trigger decides sync vs async — not the workflow author. A `sync` block on the trigger definition marks it as a lifecycle hook. |
+| **Naming convention** | `beforeX` / `afterX` = lifecycle hook (sync), `X.created` (past tense) = event (async). Workflow authors subscribe the same way to both; the distinction is transparent. |
+| **Error model** | `workflow.fail` = policy denial (intentional). Error codes distinguish policy outcomes from transient failures. |
 
-## Key Concepts
+---
 
-### 1. Blocking (sync) `emitEvent`
+## Core Concepts
 
-**Today**: `emitEvent()` is always fire-and-forget. It resolves matching workflows and schedules them via Task Manager. It returns `void`.
+### 1. Unified Registration Model
 
-**Proposed**: When a workflow's trigger specifies `sync: true`, `emitEvent` blocks the caller until the workflow completes, and returns the result (outputs, status, error). The trigger event handler uses `executeWorkflow` (direct execution) instead of `scheduleWorkflow` (Task Manager).
+Event-driven triggers and lifecycle hooks follow the **same registration model**. The only distinction is that teams explicitly mark which triggers support synchronous execution via a `sync` block, and they are invoked differently (`emitEvent()` vs `invokeHook()`).
+
+This means workflow authors do not need to think about sync versus async. Both appear the same in the workflow authoring surface and are subscribed to in the same way. For example, subscribing to `dashboard.created` (past tense — event) runs async after creation, while subscribing to `dashboard.beforeCreate` (lifecycle hook) runs sync before creation. Both `beforeX` and `afterX` hooks are synchronous — the naming convention uses past tense verbs (`created`, `completed`) to distinguish async events.
+
+```typescript
+// Lifecycle hook — invoked via invokeHook(), blocks the caller
+workflowsExtensions.registerTriggerDefinition({
+  id: 'dashboard.beforeCreate',
+  eventSchema: z.object({
+    title: z.string(),
+    description: z.string().optional(),
+  }),
+  sync: {
+    outputSchema: z.object({
+      title: z.string(),
+      description: z.string().optional(),
+    }),
+    maxTimeout: '10s',
+    failurePolicy: 'open',
+  },
+});
+
+// Event — invoked via emitEvent(), fire-and-forget
+workflowsExtensions.registerTriggerDefinition({
+  id: 'dashboard.created',
+  eventSchema: z.object({
+    dashboardId: z.string(),
+    title: z.string(),
+  }),
+});
+```
+
+Both are registered via the same `registerTriggerDefinition()` API. The `sync` block is what distinguishes a lifecycle hook from an event.
+
+### 2. Two APIs
+
+| | `emitEvent()` | `invokeHook()` |
+|---|---|---|
+| **Execution** | Async — schedules via Task Manager | Sync — executes directly, blocks the caller |
+| **Returns** | `void` | `HookResult` (status, outputs, error) |
+| **Use case** | "Something happened" (after the fact) | "Something is about to happen — check it" (before the fact) |
+| **Payload mutation** | No (caller already moved on) | No (always by-value — caller reads outputs) |
+| **Error propagation** | Failures are the workflow's problem | Failures propagate to the caller |
+
+```typescript
+// Event — fire-and-forget, caller continues immediately
+await workflowsClient.emitEvent('dashboard.created', { dashboardId: saved.id, title });
+
+// Lifecycle hook — blocks until workflow completes, returns typed result
+const result = await workflowsClient.invokeHook('dashboard.beforeCreate', {
+  title: soAttributes.title,
+  description: soAttributes.description,
+});
+if (result.status === 'failed') {
+  throw Boom.badRequest(result.error?.message ?? 'Workflow rejected dashboard creation');
+}
+soAttributes.title = result.output.title;
+soAttributes.description = result.output.description;
+```
+
+### 3. Output Model — Always By-Value
+
+The trigger definition owns the success output schema. A lifecycle hook either completes with output matching that schema or fails with a structured error.
+
+**Explicit output** — the workflow uses a `workflow.output` step to return values when the output schema differs from the input:
 
 ```yaml
-# In the workflow YAML
-triggers:
-  - type: dashboard.onCreate
-    sync: true              # [PROPOSED] — tells emitEvent to block
+steps:
+  - name: anonymise
+    type: ai.pii
+    with:
+      input: "{{ event.message }}"
+      # ...
+  - name: return_result
+    type: workflow.output
+    with:
+      message: "{{ steps.anonymise.output.anonymised_text }}"
+      tokenMap: "{{ steps.anonymise.output.token_map }}"
 ```
 
-```typescript
-// In the dashboard plugin code
-const result = await workflowsClient.emitEvent('dashboard.onCreate', dashboardEvent);
-// result is EmitEventResult | void
-// - void when no sync workflows are subscribed
-// - EmitEventResult when a sync workflow ran
+**Implicit output** — when the input and output schemas are the same shape, the workflow does not need a `workflow.output` step. The engine returns the (potentially modified) event fields as the output:
+
+```yaml
+# Input: { title, description }  —  Output: { title, description }
+# No workflow.output needed — engine returns modified event fields
+steps:
+  - name: redact_title
+    type: data.regexReplace
+    with:
+      input: "{{ event.title }}"
+      patterns:
+        - pattern: '\b\d{3}-\d{2}-\d{4}\b'
+          replacement: '***-**-****'
 ```
 
-### 2. By-ref vs. By-value
+### 4. Error Handling
 
-Two patterns for how workflows communicate changes back to the caller:
+Policy denial is represented as **intentional workflow failure** via `workflow.fail`. Error codes distinguish policy outcomes from transient or operational failures:
 
-#### By-ref (proposed — shift-right to workflows)
-
-The workflow modifies the event object directly via `event.mutate`. The caller gets back the modified object without needing to know the output contract.
-
-```typescript
-const caseObj = { title: 'My Case', description: 'Some PII here: 555-12-3456' };
-await workflowsClient.emitEvent('cases.onCreate', caseObj);
-// caseObj.description is now 'Some PII here: ***-**-****' (modified by workflow)
-saveCaseToES(caseObj);
+```yaml
+# Policy denial — workflow.fail with a reason code
+- name: block_message
+  type: workflow.fail
+  with:
+    message: "Comment blocked: PII detected"
+    reason: "pii_detected"           # policy outcome
 ```
 
-#### By-value (exists today)
-
-The workflow returns data via `workflow.output`. The caller must know the output schema and copy fields back.
+The caller receives:
 
 ```typescript
-const caseObj = { title: 'My Case', description: 'Some PII here: 555-12-3456' };
-const result = await workflowsClient.emitEvent('cases.onCreate', caseObj);
-if (result?.outputs) {
-  caseObj.title = result.outputs.title;             // caller copies each field
-  caseObj.description = result.outputs.description;
+const result = await workflowsClient.invokeHook('cases.beforeComment', commentEvent);
+if (result.status === 'failed') {
+  // result.error.reason === 'pii_detected' → policy denial
+  // result.error.reason === 'timeout' → operational failure
+  // result.error.reason === 'execution_error' → transient failure
 }
-saveCaseToES(caseObj);
 ```
 
-**Trade-off**: By-ref is simpler for the caller (especially with many fields). By-value gives the caller explicit control over what changes are accepted. See examples `04` (by-ref) and `05` (by-value) for a side-by-side comparison.
+**Fail-open vs fail-closed** is configured per trigger at registration time:
 
-### 3. Workflow contracts via `workflow.output` and `workflow.fail`
+| Policy | Behavior | Use case |
+|--------|----------|----------|
+| `open` (default) | Timeout/error → caller proceeds as if no workflow ran | Dashboard save, most CRUD |
+| `closed` | Timeout/error → caller receives the error, must handle it | Security guardrails, compliance |
 
-- **`workflow.output`** — Returns structured data to the caller. Validated against the workflow's `outputs` schema. Status: `completed`.
-- **`workflow.fail`** — Fails the workflow with a structured error (`message`, `reason`). The caller sees `status: 'failed'` and the error object.
+### 5. Multiple Workflows on the Same Hook
 
-These exist today and are used by the guardrail and by-value examples.
+When multiple workflows subscribe to the same lifecycle hook, the engine runs them **sequentially** in priority order. Each workflow receives the **same original input**, and their outputs are **merged** into a single `HookResult`:
 
-### 4. Event-driven triggers (custom)
+```
+invokeHook('dashboard.beforeCreate', { title, description })
+    │
+    ├── Workflow A (priority: 1) → output: { title: "Redacted A", description }
+    ├── Workflow B (priority: 2) → output: { title: "Redacted B", description }
+    │
+    └── Merged HookResult.output: { title: "Redacted B", description }
+         (last writer wins per field, ordered by priority)
+```
 
-Teams register custom trigger types via `registerTriggerDefinition()` in their plugin's `setup()`. Each trigger has an `eventSchema` that defines the object shape the workflow receives. See [`integration-guide.md`](./integration-guide.md) for code snippets.
+- Each workflow gets the original event as input (not the previous workflow's output)
+- Outputs are merged — later workflows (higher priority number) override earlier ones per field
+- If any workflow calls `workflow.fail`, execution short-circuits and the failure is returned
+- Priority is set by the workflow author at subscription time, giving users control over execution order
 
-## Examples
+**Per-entity filtering** — workflows can use the `on.condition` clause to filter which events they handle. For example, an Agent Builder guardrail that only runs for a specific agent:
 
-| File | Use Case | Pattern | Sync? |
-|------|----------|---------|-------|
-| [`01-guardrails-sync.yaml`](./01-guardrails-sync.yaml) | AI guardrails for chat rounds | `workflow.fail` for blocking | Yes |
-| [`02-pii-anonymization-before.yaml`](./02-pii-anonymization-before.yaml) | PII anonymization before LLM inference | Ephemeral state + `event.mutate` | Yes |
-| [`03-pii-anonymization-after.yaml`](./03-pii-anonymization-after.yaml) | PII de-anonymization after LLM response | Ephemeral state retrieval | Yes |
-| [`04-dashboard-oncreate-byref.yaml`](./04-dashboard-oncreate-byref.yaml) | PII reduction on dashboard fields | By-ref via `event.mutate` | Yes |
-| [`05-dashboard-oncreate-byvalue.yaml`](./05-dashboard-oncreate-byvalue.yaml) | Same, but by-value with `workflow.output` | By-value via outputs | Yes |
-| [`06-alert-enrichment.yaml`](./06-alert-enrichment.yaml) | Alert enrichment with AI summary | Async event-driven | No |
-| [`07-cases-guardrail.yaml`](./07-cases-guardrail.yaml) | PII blocking on case comments | `workflow.fail` for blocking | Yes |
-| [`08-sync-workflow-guardrails.md`](./08-sync-workflow-guardrails.md) | Guardrails for sync workflows | Timeout, circuit breaker, fail-open | — |
-| [`09-naming-and-trigger-mode-proposal.md`](./09-naming-and-trigger-mode-proposal.md) | API naming & trigger-level mode | Discussion: `emitEvent` → `triggerWorkflows`, `sync: true` → trigger-level `mode` | — |
+```yaml
+triggers:
+  - type: agent-builder.beforeChatRound
+    on:
+      condition: "event.agentId == 'security-analyst-agent'"
+```
+
+This lets different agents run different workflows on the same hook. A generic guardrail (no condition) runs for all agents, while agent-specific workflows run only when the condition matches.
+
+### 6. Trigger Registration API
+
+```typescript
+interface TriggerDefinitionConfig {
+  id: string;
+  eventSchema: ZodSchema;
+
+  // If present, this trigger is a lifecycle hook (sync)
+  // If absent, this trigger is an event (async)
+  sync?: {
+    outputSchema: ZodSchema;               // required — the contract for hook output
+    maxTimeout: string;                     // e.g. '10s' — max allowed workflow timeout
+    failurePolicy: 'open' | 'closed';      // default: 'open'
+    maxConcurrentWorkflows?: number;        // default: 5
+  };
+}
+```
+
+### 7. `HookResult` Type
+
+```typescript
+interface HookResult {
+  status: 'completed' | 'failed' | 'timeout';
+  output: Record<string, unknown>;         // matches trigger's outputSchema
+  error?: {
+    message: string;
+    reason?: string;                       // 'pii_detected', 'guardrail_violation', 'timeout', etc.
+  };
+}
+```
+
+---
 
 ## Architecture
 
-### Sync (blocking) flow
+### Lifecycle Hook Flow (sync)
 
 ```
-  System Component                    Workflow Engine
-  ================                    ===============
-  
-  1. Build event object
-     (trimmed-down DTO,
-      not the full saved object)
-                    ─── emitEvent(triggerId, eventObj) ───>
-                                                            2. Resolve matching workflows
-                                                            3. Check sync: true on trigger
-                                                            4. executeWorkflow (direct, not TM)
-                                                            5. Run steps
-                                                               - May modify eventObj (by-ref)
-                                                               - May call workflow.output (by-value)
-                                                               - May call workflow.fail (block/error)
-                    <── EmitEventResult { status, outputs, error } ──
+  Caller (e.g. Dashboard)                    Workflow Engine
+  =======================                    ==============
+
+  1. Build event DTO
+     { title, description }
+                    ─── invokeHook('dashboard.beforeCreate', event) ───>
+                                                            2. Resolve trigger definition
+                                                               → sync block present → hook mode
+                                                            3. Resolve subscribed workflows
+                                                               → filter by on.condition
+                                                               → order by priority
+                                                            4. For each eligible workflow (sequentially):
+                                                               a. Check circuit breaker
+                                                               b. executeWorkflow(originalEvent)
+                                                                  timeout = min(wf.timeout, trigger.maxTimeout)
+                                                               c. Collect output
+                                                               d. If workflow.fail → short-circuit, return error
+                                                            5. Merge outputs from all workflows
+                    <── HookResult { status, output, error } ──
   6. Check result:
-     - status === 'failed' → throw/reject
-     - status === 'completed' → use modified eventObj
-       or copy from outputs
-  7. Continue with create/save
+     - failed → throw / reject operation
+     - completed → use merged output fields
+  7. Continue with save
 ```
 
-### Async (fire-and-forget) flow — unchanged from today
+### Event Flow (async) — unchanged from today
 
 ```
-  System Component                    Workflow Engine
-  ================                    ===============
-  
+  Caller (e.g. Alerting)                     Workflow Engine
+  ======================                     ==============
+
   1. Something happens
-     (alert fires, etc.)
-                    ─── emitEvent(triggerId, payload) ───>
-                                                            2. Resolve matching workflows
+                    ─── emitEvent('alert.created', payload) ───>
+                                                            2. Resolve subscribed workflows
                                                             3. scheduleWorkflow (Task Manager)
                     <── void ──
   3. Continue immediately                                   4. Workflow runs async via TM
 ```
 
-## Guardrails for Sync Workflows
+---
 
-Sync workflows block HTTP requests. A broken or slow workflow can degrade the experience for all users. See **[`08-sync-workflow-guardrails.md`](./08-sync-workflow-guardrails.md)** for the full proposal, covering:
+## Lifecycle Hook Guardrails
 
-- Hard timeout enforcement (platform cap + trigger-level cap)
-- Fail-open vs. fail-closed (configurable per trigger)
-- Circuit breaker (auto-disable after repeated failures)
-- Save-time validation (block dangerous patterns)
-- Sync chain depth limits (prevent cascade)
-- Concurrency limits (max sync workflows per trigger)
-- Admin controls and observability
+Lifecycle hooks block HTTP requests. A broken or slow workflow can degrade the experience for all users. The following guardrails ensure hooks are safe by default:
 
-## Open Questions
+| Guardrail | Description | New or existing? |
+|-----------|-------------|------------------|
+| **Hard timeout** | Platform cap (30s default) + trigger-level cap (`maxTimeout`). Effective timeout = `min(workflow.timeout, trigger.maxTimeout, PLATFORM_MAX)` | Existing infra, new sync cap |
+| **Circuit breaker** | Auto-suspend workflows that fail repeatedly (5 consecutive or 50% in rolling window). Cooldown → half-open → re-evaluate. | New |
+| **Fail-open/closed** | Configurable per trigger. Most teams want fail-open (broken workflow doesn't break the feature). Security teams want fail-closed. | New |
+| **Save-time validation** | Warn on dangerous patterns in hook workflows: no `wait` steps, no `workflow.executeAsync`, `foreach` capped at 100 iterations, max 20 steps. | New |
+| **Chain depth limit** | Sync chain depth capped at 2 (existing `EventChainContext` infra, tighter limit for hooks). Prevents hook → hook → hook cascade. | Existing infra, tighter limit |
+| **Concurrency limit** | Max N workflows per hook invocation (default 5, configurable via `maxConcurrentWorkflows`). Sequential execution ordered by priority; first `workflow.fail` short-circuits the rest. Outputs are merged. | New |
+| **Resource limits** | Step output size limits, Layer 1 pre-emptive I/O limits, Layer 2 generic output check — all inherited from existing engine infrastructure. | Existing |
+| **Admin controls** | Global kill switch (`workflows.hooks.enabled: false`), per-trigger disable, per-workflow disable, observability dashboard. | New |
 
-1. **Who decides sync vs async?** The current examples put `sync: true` on the workflow YAML. An alternative proposal moves the mode to the trigger registration level — the team that owns the code path decides. See [`09-naming-and-trigger-mode-proposal.md`](./09-naming-and-trigger-mode-proposal.md) for a full discussion.
+See [`archive/08-sync-workflow-guardrails.md`](./archive/08-sync-workflow-guardrails.md) for the full guardrails proposal with detailed architecture.
 
-2. **API naming**: `emitEvent()` implies fire-and-forget, which is misleading for blocking calls. Should we rename to `triggerWorkflows()`, `invokeWorkflows()`, or split into two APIs (`emitEvent` + `invokeHook`)? See [`09-naming-and-trigger-mode-proposal.md`](./09-naming-and-trigger-mode-proposal.md) for options and trade-offs.
+---
 
-3. **Multiple sync workflows**: If 3 workflows subscribe to the same sync trigger, do they run sequentially? In parallel? What if one fails — do the others still run? See the [concurrency limits section](./08-sync-workflow-guardrails.md#7-concurrency-limits-per-trigger-type) in the guardrails proposal.
+## Legend
 
-4. **Timeouts**: What is the max execution time for a sync workflow? This blocks an HTTP request. Guardrails should be fast (< 5s), but PII reduction with AI could be slower. See the [hard timeout](./08-sync-workflow-guardrails.md#1-hard-timeout-for-sync-workflows) and [trigger-level timeout cap](./08-sync-workflow-guardrails.md#2-trigger-level-timeout-cap) sections in the guardrails proposal.
+Throughout the examples, comments indicate what exists today vs. what is proposed:
 
-5. **By-ref implementation**: How does `event.mutate` actually work under the hood? Does the execution engine pass a mutable reference, or does it merge the mutation result back into the caller's object after completion?
+- `[EXISTS]` — This syntax/feature works today in the workflow engine
+- `[PROPOSED]` — This syntax/feature does not exist yet and is part of this design proposal
+- `[PROPOSED STEP]` — A new step type that would need to be implemented
 
-6. **AB migration path**: Agent Builder currently uses a custom loop + `BeforeAgentWorkflowOutput` contract. How do we migrate to the standard model without breaking existing workflows that rely on `abort`/`abort_message`/`new_prompt`?
+---
 
-## Related Files
+## Team Integration Guides
 
-- [`integration-guide.md`](./integration-guide.md) — TypeScript code snippets showing how each team integrates
-- [`08-sync-workflow-guardrails.md`](./08-sync-workflow-guardrails.md) — Guardrails for sync workflows (timeouts, circuit breaker, fail-open/closed)
-- [`09-naming-and-trigger-mode-proposal.md`](./09-naming-and-trigger-mode-proposal.md) — API naming discussion and trigger-level mode proposal
-- Existing trigger docs: `src/platform/plugins/shared/workflows_extensions/dev_docs/TRIGGERS.md`
-- Current AB guardrail code: `x-pack/platform/plugins/shared/agent_builder/server/hooks/agent_workflows/`
-- Dashboard create: `src/platform/plugins/shared/dashboard/server/api/create/create.ts`
-- Cases create: `x-pack/platform/plugins/shared/cases/server/client/cases/create.ts`
+Each guide contains trigger registrations, workflow YAML examples, and caller code for a specific team:
+
+| Guide | Lifecycle hooks | Key patterns |
+|-------|----------------|--------------|
+| [**Agent Builder**](./agent-builder.md) | `beforeChatRound` (guardrails), `beforeInference` / `afterInference` (PII anonymization) | Trigger output chaining, guardrail with `workflow.fail`, migration from `BeforeAgentWorkflowOutput` |
+| [**Dashboards**](./dashboards.md) | `beforeCreate` (PII reduction) | Implicit output (input = output schema), `data.regexReplace` |
+| [**Cases**](./cases.md) | `beforeCreate`, `beforeComment` (PII guardrail) | `ai.guardrail` step, `workflow.fail` for blocking |
+
+---
+
+## Archive
+
+Previous iteration files (numbered examples, discussion docs, integration guide) are preserved in [`archive/`](./archive/) for historical reference.
