@@ -1,4 +1,4 @@
-# Workflow-Driven Cross-Cutting Concerns
+# Workflow Lifecycle Hooks Proposal
 
 > **Purpose**: Design proposal for extending Kibana's workflow engine to support **event-driven triggers** and **lifecycle hooks** — a unified model that lets teams like Agent Builder, Dashboards, and Cases delegate cross-cutting concerns (guardrails, PII reduction, enrichment) to user-authored or system workflows.
 
