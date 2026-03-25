@@ -9,9 +9,10 @@ The current proposal introduces sync (blocking) workflow execution via `sync: tr
 
 | # | Problem | Solution |
 |---|---------|----------|
-| **1** | The subscriber (workflow YAML) decides sync/async — the caller can't predict behavior | Move `mode` + guardrails + `outputSchema` to `registerTriggerDefinition` |
+| **1** | The subscriber (workflow YAML) decides sync/async — the caller can't predict behavior | Move guardrails + `outputSchema` to `registerTriggerDefinition` via a `sync` capability block |
 | **2** | One API (`emitEvent`) has an ambiguous return type that changes based on subscriber config | Split into `emitEvent()` (async, void) and `invokeEvent()` (sync, typed result) |
 | **3** | `event.mutate` (by-ref) allows invisible mutation of the caller's data | Always by-value — the caller receives output and decides what to accept |
+| **4** | Sync workflows block the main process sequentially, adding unnecessary latency | Support parallel execution via `Promise.all` — run workflow and main process concurrently |
 
 ---
 
@@ -67,40 +68,41 @@ This is the **"action at a distance"** problem. A YAML file changes the behavior
 - [Inngest: Invoking functions directly](https://inngest.com/docs/guides/invoking-functions-directly) — "invoke provides direct, RPC-like function calls"
 - [Inngest: Sending events from functions](https://www.inngest.com/docs/guides/sending-events-from-functions) — "sendEvent does not wait for triggered functions to complete"
 
-### Solution: `mode` + guardrails + `outputSchema` on `registerTriggerDefinition`
+### Solution: `sync` capability block on `registerTriggerDefinition`
 
-The team that registers the trigger owns the sync/async decision. The workflow author just subscribes — the mode is inherited.
+The team that registers the trigger owns whether sync invocation is supported. The workflow author just subscribes — the capability is inherited. There is no explicit `mode` flag — the **presence of the `sync` block** means the trigger supports `invokeEvent()`; its **absence** means async-only via `emitEvent()`.
 
 ```typescript
-// Sync trigger — registered by the dashboard team
+// Trigger that supports sync invocation — registered by the dashboard team
 workflowsExtensions.registerTriggerDefinition({
   id: 'dashboard.beforeCreate',
-  mode: 'sync',
   eventSchema: z.object({
     title: z.string(),
     description: z.string().optional(),
   }),
-  outputSchema: z.object({
-    title: z.string(),
-    description: z.string().optional(),
-  }),
-  maxTimeout: '10s',
-  failurePolicy: 'open',
-  maxConcurrentWorkflows: 3,
+  sync: {
+    outputSchema: z.object({
+      title: z.string(),
+      description: z.string().optional(),
+    }),
+    maxTimeout: '10s',
+    failurePolicy: 'open',
+    maxConcurrentWorkflows: 3,
+  },
 });
 
-// Async trigger — registered by the alerting team
+// Async-only trigger — registered by the alerting team
+// No `sync` block → invokeEvent() will throw if called on this trigger
 workflowsExtensions.registerTriggerDefinition({
   id: 'alert.created',
-  mode: 'async',
   eventSchema: z.object({
     alertId: z.string(),
     severity: z.string(),
   }),
-  // No outputSchema — async triggers don't return results
-  // No maxTimeout, failurePolicy — not relevant for async
 });
 ```
+
+Note that `emitEvent()` (fire-and-forget) works on **any** trigger, regardless of whether `sync` is defined. This allows async consumers (audit logging, telemetry) to subscribe to a trigger that also supports sync invocation. Only `invokeEvent()` requires the `sync` block.
 
 **What changes in the workflow YAML:**
 
@@ -112,11 +114,11 @@ triggers:
 
 # After (proposed)
 triggers:
-  - type: dashboard.beforeCreate  # mode is inherited from trigger definition
-                                   # no sync/async config in YAML — the trigger IS sync
+  - type: dashboard.beforeCreate  # sync capability is inherited from trigger definition
+                                   # no sync/async config in YAML
 ```
 
-**Why `outputSchema`?** When a trigger is sync, the caller expects structured output. The `outputSchema` defines what the workflow must return via `workflow.output`. The engine validates this at three layers:
+**Why `outputSchema`?** When a trigger supports sync invocation, the caller expects structured output. The `outputSchema` defines what the workflow must return via `workflow.output`. The engine validates this at three layers:
 
 1. **Save-time**: When a workflow is saved with a sync trigger subscription, the engine checks that the workflow's declared `outputs` is compatible with the trigger's `outputSchema`. Incompatible outputs → save rejected.
 2. **Runtime (step-level)**: The existing `workflow.output` step already validates output against the workflow's declared `outputs` schema via `buildFieldsZodValidator`. If the trigger's `outputSchema` is propagated as the workflow's output contract, this validation works without changes.
@@ -130,31 +132,36 @@ triggers:
 ### Full trigger definition type
 
 ```typescript
-interface TriggerDefinitionBase<EventSchema extends z.ZodType> {
-  id: string;
-  eventSchema: EventSchema;
-}
-
-interface AsyncTriggerDefinition<EventSchema extends z.ZodType>
-  extends TriggerDefinitionBase<EventSchema> {
-  mode: 'async';
-}
-
-interface SyncTriggerDefinition<
-  EventSchema extends z.ZodType,
-  OutputSchema extends z.ZodType
-> extends TriggerDefinitionBase<EventSchema> {
-  mode: 'sync';
+interface SyncCapability<OutputSchema extends z.ZodType> {
   outputSchema: OutputSchema;
   maxTimeout: string;
   failurePolicy: 'open' | 'closed';
   maxConcurrentWorkflows?: number;    // default: 5
 }
 
-type TriggerDefinition =
-  | AsyncTriggerDefinition<z.ZodType>
-  | SyncTriggerDefinition<z.ZodType, z.ZodType>;
+interface TriggerDefinition<
+  EventSchema extends z.ZodType = z.ZodType,
+  OutputSchema extends z.ZodType = z.ZodType
+> {
+  id: string;
+  eventSchema: EventSchema;
+
+  /**
+   * If present, this trigger supports synchronous invocation via invokeEvent().
+   * If absent, only emitEvent() (async) is supported.
+   *
+   * emitEvent() works on ALL triggers regardless of this field.
+   */
+  sync?: SyncCapability<OutputSchema>;
+}
 ```
+
+The engine infers the trigger's capabilities from the shape of the registration:
+
+| `sync` block | `emitEvent()` | `invokeEvent()` |
+|-------------|---------------|-----------------|
+| Present | Works (fire-and-forget) | Works (sync, returns result) |
+| Absent | Works (fire-and-forget) | Throws: "This trigger has no sync capability" |
 
 ---
 
@@ -215,15 +222,14 @@ There is no single `sendMessage()` function with a polymorphic return type. Each
 export interface WorkflowsClient {
   /**
    * Fire-and-forget: schedule subscribed workflows via Task Manager.
-   * Always returns void. Only works with triggers registered as mode: 'async'.
-   * Throws if called on a sync trigger.
+   * Always returns void. Works on ANY trigger (with or without sync capability).
    */
   emitEvent(triggerId: string, payload: Record<string, unknown>): Promise<void>;
 
   /**
    * Synchronous invocation: execute subscribed workflows directly and return the result.
-   * Always returns InvokeEventResult. Only works with triggers registered as mode: 'sync'.
-   * Throws if called on an async trigger.
+   * Always returns InvokeEventResult. Only works on triggers that have a `sync` block.
+   * Throws if the trigger has no sync capability.
    */
   invokeEvent(triggerId: string, payload: Record<string, unknown>): Promise<InvokeEventResult>;
 }
@@ -238,21 +244,19 @@ export interface InvokeEventResult {
 **The engine enforces correct usage:**
 
 ```typescript
-// CORRECT — sync trigger with invokeEvent
+// Sync invocation — trigger has a `sync` block
 const result = await workflowsClient.invokeEvent('dashboard.beforeCreate', event);
 
-// CORRECT — async trigger with emitEvent
+// Async invocation — works on any trigger
 await workflowsClient.emitEvent('alert.created', payload);
 
-// ERROR at runtime — calling emitEvent on a sync trigger
+// Also valid — emitEvent works on triggers with sync capability too
+// (useful for async consumers like audit logging on the same trigger)
 await workflowsClient.emitEvent('dashboard.beforeCreate', event);
-// → throws: "Trigger 'dashboard.beforeCreate' is registered with mode: 'sync'.
-//           Use invokeEvent() instead."
 
-// ERROR at runtime — calling invokeEvent on an async trigger
+// ERROR — invokeEvent on a trigger without sync capability
 await workflowsClient.invokeEvent('alert.created', payload);
-// → throws: "Trigger 'alert.created' is registered with mode: 'async'.
-//           Use emitEvent() instead."
+// → throws: "Trigger 'alert.created' has no sync capability. Use emitEvent() instead."
 ```
 
 **Why not a single API with a better name?** The `09-naming-and-trigger-mode-proposal.md` recommends renaming to `triggerWorkflows()` with the same dual return type. This solves the naming problem but not the type safety problem. The caller still gets `Promise<WorkflowResult | void>` and must check at runtime. Two APIs eliminate the ambiguity entirely — each call site is self-documenting:
@@ -270,13 +274,14 @@ await workflowsClient.emitEvent('alert.created', payload);
 
 ### Relationship to Problem 1
 
-The two APIs and the trigger `mode` reinforce each other:
+The two APIs and the trigger `sync` capability block reinforce each other:
 
-- **`mode` on the trigger** prevents accidental sync: the workflow author can't add `sync: true` to a trigger the registrar designed as async.
+- **`sync` block on the trigger** declares that sync invocation is supported and defines the guardrails. The workflow author can't make a trigger sync — only the registrar can.
 - **Two APIs** give the caller compile-time clarity: `invokeEvent` always returns a result, `emitEvent` always returns void.
-- **The engine validates both**: calling `invokeEvent` on an async trigger (or vice versa) is a hard error.
+- **The engine validates**: calling `invokeEvent` on a trigger without a `sync` block is a hard error.
+- **`emitEvent` is universal**: it works on any trigger, allowing async consumers (audit, telemetry) to subscribe to triggers that also support sync invocation.
 
-Without `mode`, any trigger could be called either way (dangerous). Without two APIs, the return type is ambiguous (confusing). Together, they create a system where misuse is caught early and every call site is self-documenting.
+Without the `sync` block, there's no declaration of sync capability or guardrails. Without two APIs, the return type is ambiguous. Together, they create a system where misuse is caught early and every call site is self-documenting.
 
 ---
 
@@ -426,7 +431,112 @@ steps:
 
 ---
 
-## How the Three Solutions Work Together
+## Problem 4: Sequential Blocking Adds Unnecessary Latency
+
+### What the current proposal does
+
+In the current proposal, sync workflows run **before** the main process. The caller awaits the workflow, inspects the result, and only then proceeds with the actual operation:
+
+```typescript
+// Current: sequential — workflow runs first, then the process
+const result = await workflowsClient.emitEvent('agent-builder.chatRound', roundEvent);
+if (result?.status === 'failed') throw ...;
+
+// Only now does the actual inference start
+const response = await llm.inference(roundEvent.message);
+```
+
+Total time = workflow duration + inference duration. For a guardrail that checks "is this message off-topic?" via an LLM call, the workflow might take 2-3 seconds. The inference itself takes 5-10 seconds. Sequential execution means 7-13 seconds total.
+
+### Why this is problematic for certain use cases
+
+Not all sync workflows need to **precede** the main process. Some are **concurrent guards** — they run alongside the process and only matter if they fail:
+
+- **Off-topic detection**: Check if the prompt is off-topic while inference is already running. If the guardrail passes, the inference result is used. If it fails, discard the inference result and reject.
+- **PII scanning**: Scan the input for PII while the actual operation proceeds. If PII is found, abort. If not, the operation already completed — no wasted time.
+- **Rate limit / quota check**: Verify the user hasn't exceeded limits while the operation starts. Abort if they have.
+
+In all these cases, the workflow doesn't **transform** the input — it's a pass/fail gate. The main process doesn't need the workflow's output to start. Running them in parallel saves the workflow's entire duration from the critical path.
+
+### Solution: Parallel execution via `Promise.all`
+
+The caller should be able to run the workflow and the main process concurrently. If the workflow fails, the whole thing fails. If the workflow passes, the main process result is used.
+
+```typescript
+// Parallel: workflow and inference run concurrently
+const [guardrailResult, inferenceResponse] = await Promise.all([
+  workflowsClient.invokeEvent('agent-builder.beforeChatRound', { message: prompt }),
+  llm.inference(prompt),
+]);
+
+if (guardrailResult.error) {
+  // Guardrail failed — discard inferenceResponse, reject the operation
+  throw createWorkflowAbortedError(guardrailResult.error.message);
+}
+
+// Guardrail passed — use the inference result
+return inferenceResponse;
+```
+
+Total time = max(workflow duration, inference duration) instead of sum. If the guardrail takes 2s and inference takes 8s, total is 8s instead of 10s.
+
+### This works naturally with the two-API split
+
+The key insight is that **this is not a new API or engine feature** — it falls out naturally from `invokeEvent` returning a `Promise`. The caller controls the concurrency. The engine doesn't need to know that the caller is running something else in parallel.
+
+But it only works cleanly with the by-value pattern (Problem 3). If the workflow used `event.mutate` to transform the input, you couldn't start the main process in parallel — it would be operating on the un-transformed input. By-value means:
+
+- The workflow returns its result (pass/fail, or transformed data) as a **separate object**
+- The main process can use the **original input** to start immediately
+- The caller merges results after both complete
+
+### When to use sequential vs parallel
+
+| Pattern | Use when | Example |
+|---------|----------|---------|
+| **Sequential** (`await invokeEvent` then process) | Workflow **transforms** the input and the process needs the transformed version | PII anonymization before inference — the LLM must see the redacted text |
+| **Parallel** (`Promise.all([invokeEvent, process])`) | Workflow is a **pass/fail gate** and the process doesn't need the workflow's output to start | Off-topic detection, rate limiting, quota checks |
+
+The caller makes this decision — not the engine, not the workflow. This is another benefit of the by-value, caller-controls-everything approach.
+
+### Example: Agent Builder with parallel guardrail
+
+```typescript
+// Before: sequential — 2s guardrail + 8s inference = 10s
+const wfResult = await workflowsClient.invokeEvent('agent-builder.beforeChatRound', {
+  message: prompt,
+});
+if (wfResult.error) throw createWorkflowAbortedError(wfResult.error.message);
+const response = await llm.inference(prompt);
+
+// After: parallel — max(2s, 8s) = 8s
+const [wfResult, response] = await Promise.all([
+  workflowsClient.invokeEvent('agent-builder.beforeChatRound', { message: prompt }),
+  llm.inference(prompt),
+]);
+if (wfResult.error) throw createWorkflowAbortedError(wfResult.error.message);
+// guardrail passed — use inference result
+```
+
+This pattern also composes with `AbortController` for early cancellation — if the guardrail fails quickly (e.g., 200ms), the caller can abort the inference to save resources:
+
+```typescript
+const abortController = new AbortController();
+
+const [wfResult, response] = await Promise.allSettled([
+  workflowsClient.invokeEvent('agent-builder.beforeChatRound', { message: prompt }),
+  llm.inference(prompt, { signal: abortController.signal }),
+]);
+
+if (wfResult.status === 'fulfilled' && wfResult.value.error) {
+  abortController.abort();
+  throw createWorkflowAbortedError(wfResult.value.error.message);
+}
+```
+
+---
+
+## How the Four Solutions Work Together
 
 ### Architecture flow
 
@@ -437,13 +547,13 @@ steps:
   1. Register trigger at setup:
      registerTriggerDefinition({
        id: 'dashboard.beforeCreate',
-       mode: 'sync',
        eventSchema: z.object({...}),
-       outputSchema: z.object({...}),   ─── Stored ───→  Trigger Registry
-       maxTimeout: '10s',                                 - mode: sync
-       failurePolicy: 'open',                             - eventSchema
-     })                                                    - outputSchema
-                                                           - guardrails
+       sync: {                           ─── Stored ───→  Trigger Registry
+         outputSchema: z.object({...}),                    - eventSchema
+         maxTimeout: '10s',                                - sync capability:
+         failurePolicy: 'open',                              outputSchema,
+       },                                                    guardrails
+     })
                                                                 │
                                                                 │  At workflow save time:
                                         ◄── Validate ──────────┤  - workflow outputs
@@ -469,7 +579,7 @@ steps:
      const { output, error } =
        await workflowsClient
          .invokeEvent(                  ─── invokeEvent() ──→  5. Engine checks:
-           'dashboard.beforeCreate',                              - trigger mode == sync? ✓
+           'dashboard.beforeCreate',                              - trigger has sync block? ✓
            event                                                  - circuit breaker open? ✗
          );                                                       - resolve subscribed workflows
                                                                   - deep-clone event as input
@@ -515,7 +625,7 @@ soAttributes.description = dashboardEvent.description;
 **After (this proposal):**
 
 ```typescript
-// Who decides sync? → Trigger definition (mode: 'sync')
+// Who decides sync? → Trigger definition (sync block present)
 // What API? → invokeEvent (always returns typed result)
 // How does data come back? → output object (by-value, caller merges)
 
@@ -537,13 +647,13 @@ Object.assign(soAttributes, output);
 
 | File | Impact |
 |------|--------|
-| `01-guardrails-sync.yaml` | Remove `sync: true` from trigger clause. Trigger `agent-builder.chatRound` is registered as `mode: 'sync'` by AB team. `workflow.fail` works unchanged. |
+| `01-guardrails-sync.yaml` | Remove `sync: true` from trigger clause. Trigger `agent-builder.chatRound` is registered with a `sync` block by AB team. `workflow.fail` works unchanged. |
 | `02-pii-anonymization-before.yaml` | Remove `sync: true`. Replace `event.mutate` step with `workflow.output` step. Add `outputs:` declaration. |
 | `03-pii-anonymization-after.yaml` | Same — remove `event.mutate`, use `workflow.output`. |
 | `04-dashboard-oncreate-byref.yaml` | Retire in favor of by-value approach. The by-ref variant is no longer proposed. |
 | `05-dashboard-oncreate-byvalue.yaml` | Becomes the canonical pattern. Rename trigger to `dashboard.beforeCreate`. Remove `sync: true`. |
 | `06-alert-enrichment.yaml` | Unchanged — async trigger, `emitEvent`, no output. |
-| `07-cases-guardrail.yaml` | Remove `sync: true`. Trigger `cases.beforeCreateComment` registered as `mode: 'sync'` by cases team. |
+| `07-cases-guardrail.yaml` | Remove `sync: true`. Trigger `cases.beforeCreateComment` registered with a `sync` block by cases team. |
 | `08-sync-workflow-guardrails.md` | Guardrail config moves from standalone proposal into `registerTriggerDefinition`. The content remains valid as rationale. |
 | `09-naming-and-trigger-mode-proposal.md` | Superseded by this document. The single-API recommendation (`triggerWorkflows`) is replaced by the two-API split. |
 | `integration-guide.md` | Update call sites to use `invokeEvent`/`emitEvent`. Remove `event.mutate` references. Add `outputSchema` to trigger registrations. |
@@ -558,4 +668,4 @@ Object.assign(soAttributes, output);
 
 4. **Multiple sync workflows**: When N workflows subscribe to a sync trigger, they run sequentially (ordered by creation date). The first `workflow.fail` short-circuits the rest. Outputs from earlier workflows are NOT chained as inputs to later ones — each gets the original event. The final `output` returned to the caller is from the last successful workflow. Should we instead merge outputs from all workflows?
 
-5. **AB migration path**: Agent Builder currently uses a custom loop with `BeforeAgentWorkflowOutput` (`abort`, `abort_message`, `new_prompt`). Migration: register `agent-builder.beforeChatRound` as a sync trigger with `outputSchema: z.object({ message: z.string() })` and `failurePolicy: 'closed'`. The `abort` semantic maps to `workflow.fail`. The `new_prompt` semantic maps to returning `{ message: newPrompt }` via `workflow.output`. The custom `runBeforeAgentWorkflows` loop is replaced by a single `invokeEvent` call.
+5. **AB migration path**: Agent Builder currently uses a custom loop with `BeforeAgentWorkflowOutput` (`abort`, `abort_message`, `new_prompt`). Migration: register `agent-builder.beforeChatRound` with a `sync` block containing `outputSchema: z.object({ message: z.string() })` and `failurePolicy: 'closed'`. The `abort` semantic maps to `workflow.fail`. The `new_prompt` semantic maps to returning `{ message: newPrompt }` via `workflow.output`. The custom `runBeforeAgentWorkflows` loop is replaced by a single `invokeEvent` call.
