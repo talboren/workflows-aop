@@ -73,21 +73,21 @@ These exist today and are used by the guardrail and by-value examples.
 
 ### 4. Event-driven triggers (custom)
 
-Teams register custom trigger types via `registerTriggerDefinition()` in their plugin's `setup()`. Each trigger has an `eventSchema` that defines the object shape the workflow receives. See `integration-guide.md` for code snippets.
+Teams register custom trigger types via `registerTriggerDefinition()` in their plugin's `setup()`. Each trigger has an `eventSchema` that defines the object shape the workflow receives. See [`integration-guide.md`](./integration-guide.md) for code snippets.
 
 ## Examples
 
 | File | Use Case | Pattern | Sync? |
 |------|----------|---------|-------|
-| `01-guardrails-sync.yaml` | AI guardrails for chat rounds | `workflow.fail` for blocking | Yes |
-| `02-pii-anonymization-before.yaml` | PII anonymization before LLM inference | Ephemeral state + `event.mutate` | Yes |
-| `03-pii-anonymization-after.yaml` | PII de-anonymization after LLM response | Ephemeral state retrieval | Yes |
-| `04-dashboard-oncreate-byref.yaml` | PII reduction on dashboard fields | By-ref via `event.mutate` | Yes |
-| `05-dashboard-oncreate-byvalue.yaml` | Same, but by-value with `workflow.output` | By-value via outputs | Yes |
-| `06-alert-enrichment.yaml` | Alert enrichment with AI summary | Async event-driven | No |
-| `07-cases-guardrail.yaml` | PII blocking on case comments | `workflow.fail` for blocking | Yes |
-| `08-sync-workflow-guardrails.md` | Guardrails for sync workflows | Timeout, circuit breaker, fail-open | — |
-| `09-naming-and-trigger-mode-proposal.md` | API naming & trigger-level mode | Discussion: `emitEvent` → `triggerWorkflows`, `sync: true` → trigger-level `mode` | — |
+| [`01-guardrails-sync.yaml`](./01-guardrails-sync.yaml) | AI guardrails for chat rounds | `workflow.fail` for blocking | Yes |
+| [`02-pii-anonymization-before.yaml`](./02-pii-anonymization-before.yaml) | PII anonymization before LLM inference | Ephemeral state + `event.mutate` | Yes |
+| [`03-pii-anonymization-after.yaml`](./03-pii-anonymization-after.yaml) | PII de-anonymization after LLM response | Ephemeral state retrieval | Yes |
+| [`04-dashboard-oncreate-byref.yaml`](./04-dashboard-oncreate-byref.yaml) | PII reduction on dashboard fields | By-ref via `event.mutate` | Yes |
+| [`05-dashboard-oncreate-byvalue.yaml`](./05-dashboard-oncreate-byvalue.yaml) | Same, but by-value with `workflow.output` | By-value via outputs | Yes |
+| [`06-alert-enrichment.yaml`](./06-alert-enrichment.yaml) | Alert enrichment with AI summary | Async event-driven | No |
+| [`07-cases-guardrail.yaml`](./07-cases-guardrail.yaml) | PII blocking on case comments | `workflow.fail` for blocking | Yes |
+| [`08-sync-workflow-guardrails.md`](./08-sync-workflow-guardrails.md) | Guardrails for sync workflows | Timeout, circuit breaker, fail-open | — |
+| [`09-naming-and-trigger-mode-proposal.md`](./09-naming-and-trigger-mode-proposal.md) | API naming & trigger-level mode | Discussion: `emitEvent` → `triggerWorkflows`, `sync: true` → trigger-level `mode` | — |
 
 ## Architecture
 
@@ -145,21 +145,25 @@ Sync workflows block HTTP requests. A broken or slow workflow can degrade the ex
 
 ## Open Questions
 
-1. **Who decides sync vs async?** The proposal puts `sync: true` on the workflow's trigger definition. But what if the emitter wants to control it? (e.g., dashboard team always wants sync for `onCreate` but async for `onView`)
+1. **Who decides sync vs async?** The current examples put `sync: true` on the workflow YAML. An alternative proposal moves the mode to the trigger registration level — the team that owns the code path decides. See [`09-naming-and-trigger-mode-proposal.md`](./09-naming-and-trigger-mode-proposal.md) for a full discussion.
 
-2. **Multiple sync workflows**: If 3 workflows subscribe to `dashboard.onCreate` with `sync: true`, do they run sequentially? In parallel? What if one fails — do the others still run? → See `08-sync-workflow-guardrails.md` §7
+2. **API naming**: `emitEvent()` implies fire-and-forget, which is misleading for blocking calls. Should we rename to `triggerWorkflows()`, `invokeWorkflows()`, or split into two APIs (`emitEvent` + `invokeHook`)? See [`09-naming-and-trigger-mode-proposal.md`](./09-naming-and-trigger-mode-proposal.md) for options and trade-offs.
 
-3. **Timeouts**: What is the max execution time for a sync workflow? This blocks an HTTP request. Guardrails should be fast (< 5s), but PII reduction with AI could be slower. → See `08-sync-workflow-guardrails.md` §1–2
+3. **Multiple sync workflows**: If 3 workflows subscribe to the same sync trigger, do they run sequentially? In parallel? What if one fails — do the others still run? See the [concurrency limits section](./08-sync-workflow-guardrails.md#7-concurrency-limits-per-trigger-type) in the guardrails proposal.
 
-4. **By-ref implementation**: How does `event.mutate` actually work under the hood? Does the execution engine pass a mutable reference, or does it merge the mutation result back into the caller's object after completion?
+4. **Timeouts**: What is the max execution time for a sync workflow? This blocks an HTTP request. Guardrails should be fast (< 5s), but PII reduction with AI could be slower. See the [hard timeout](./08-sync-workflow-guardrails.md#1-hard-timeout-for-sync-workflows) and [trigger-level timeout cap](./08-sync-workflow-guardrails.md#2-trigger-level-timeout-cap) sections in the guardrails proposal.
 
-5. **Trigger-implied inputs**: When a workflow subscribes to `dashboard.onCreate`, should the event schema automatically become the workflow's inputs? Or should the workflow author still declare inputs explicitly?
+5. **By-ref implementation**: How does `event.mutate` actually work under the hood? Does the execution engine pass a mutable reference, or does it merge the mutation result back into the caller's object after completion?
 
-6. **AB migration path**: Agent Builder currently uses a custom loop + `BeforeAgentWorkflowOutput` contract. How do we migrate to the standard `emitEvent` model without breaking existing workflows that rely on `abort`/`abort_message`/`new_prompt`?
+6. **Trigger-implied inputs**: When a workflow subscribes to `dashboard.onCreate`, should the event schema automatically become the workflow's inputs? Or should the workflow author still declare inputs explicitly?
+
+7. **AB migration path**: Agent Builder currently uses a custom loop + `BeforeAgentWorkflowOutput` contract. How do we migrate to the standard model without breaking existing workflows that rely on `abort`/`abort_message`/`new_prompt`?
 
 ## Related Files
 
-- `integration-guide.md` — TypeScript code snippets showing how each team integrates
+- [`integration-guide.md`](./integration-guide.md) — TypeScript code snippets showing how each team integrates
+- [`08-sync-workflow-guardrails.md`](./08-sync-workflow-guardrails.md) — Guardrails for sync workflows (timeouts, circuit breaker, fail-open/closed)
+- [`09-naming-and-trigger-mode-proposal.md`](./09-naming-and-trigger-mode-proposal.md) — API naming discussion and trigger-level mode proposal
 - Existing trigger docs: `src/platform/plugins/shared/workflows_extensions/dev_docs/TRIGGERS.md`
 - Current AB guardrail code: `x-pack/platform/plugins/shared/agent_builder/server/hooks/agent_workflows/`
 - Dashboard create: `src/platform/plugins/shared/dashboard/server/api/create/create.ts`
