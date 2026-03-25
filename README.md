@@ -2,6 +2,22 @@
 
 > **Purpose**: Design proposal for extending Kibana's workflow engine to support **event-driven triggers** and **lifecycle hooks** — a unified model that lets teams like Agent Builder, Dashboards, and Cases delegate cross-cutting concerns (guardrails, PII reduction, enrichment) to user-authored or system workflows.
 
+## What Are Lifecycle Hooks?
+
+Today, the workflow engine supports **events** — when something happens in the system (e.g., an alert fires), workflows run in the background. Events are fire-and-forget: the system doesn't wait for the workflow to finish.
+
+This proposal introduces a new concept: **lifecycle hooks**. A lifecycle hook lets you run a workflow **before or after** something happens — synchronously, inline with the operation. The system waits for the workflow to complete, and the workflow can inspect, modify, or reject the operation.
+
+| | Events | Lifecycle Hooks |
+|---|---|---|
+| **When** | After something happened | Before/after something is about to happen |
+| **Execution** | Background (async) | Inline, blocking (sync) |
+| **Can modify the operation?** | No — it already happened | Yes — can modify inputs or reject |
+| **API** | `emitEvent()` | `invokeHook()` |
+| **Example** | `dashboard.created` — run enrichment after save | `dashboard.beforeCreate` — redact PII before save |
+
+Both events and lifecycle hooks are registered the same way and appear identical in the workflow authoring surface. The difference is in how they're invoked and whether they block the caller.
+
 ## Proposed Design Decisions
 
 The following decisions are reflected throughout the examples:
