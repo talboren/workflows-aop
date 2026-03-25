@@ -99,6 +99,12 @@ This matters for usability: if the dashboard event had 7+ fields, an explicit `w
 
 If the schemas were **different** (e.g., the output includes extra fields like `piiDetected: boolean`), the workflow would need an explicit `workflow.output` step.
 
+### Redaction vs. anonymization
+
+This workflow uses **redaction** — PII patterns are masked and the originals are discarded. This is appropriate here because the dashboard is being saved for the first time and the original values do not need to be recovered later.
+
+If the use case required **anonymization** — replacing values with reversible tokens so originals can be restored (e.g. for audit trails or de-anonymizing downstream responses) — the `ai.pii` step [PROPOSED STEP] should be used instead, following the pattern in the [Agent Builder guide](./agent-builder.md). That pattern persists a token map to ES via `replacementsId` and enables the `transform.pii_restore` step to restore originals on demand.
+
 ---
 
 ## Caller Code

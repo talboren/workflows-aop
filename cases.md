@@ -108,6 +108,12 @@ steps:
 
 **Pattern reusability**: The `ai.guardrail` step is the same step type used in the Agent Builder chat round guardrails. Only the trigger and the input field differ. A workflow author can copy this pattern to any other trigger with minimal changes.
 
+### Blocking vs. anonymizing
+
+This workflow **blocks** comments that contain PII — the operation is rejected entirely. This is appropriate when the policy is zero-tolerance (no PII may be persisted at all).
+
+An alternative policy is **anonymization before save** — replace PII with reversible tokens, persist the case with masked values, and allow de-anonymization later. That pattern uses the `ai.pii` step [PROPOSED STEP], which always persists the token map to ES via the inference plugin's `ReplacementsRepository` and returns a `replacementsId`. It requires adding `replacementsId` to the `cases.beforeCreate` output schema and storing it on the Case object for later retrieval. See the [Agent Builder guide](./agent-builder.md) for the full pattern.
+
 ---
 
 ## Caller Code
@@ -164,8 +170,12 @@ steps:
 +      owner: commentReq.owner,
 +    });
 +
-+    if (hookResult.status === 'failed') {
-+      // failurePolicy: 'closed' → block the comment
++    if (hookResult.status === 'failed' || hookResult.status === 'timeout') {
++      // failurePolicy: 'closed' → block on both policy denial AND timeout/error.
++      // hookResult.error.reason distinguishes the two:
++      //   'pii_detected'     → intentional policy denial (workflow.fail)
++      //   'timeout'          → workflow exceeded maxTimeout
++      //   'execution_error'  → transient engine failure
 +      throw createCaseError({
 +        message: hookResult.error?.message ?? 'Comment blocked by workflow',
 +        logger,
@@ -177,7 +187,7 @@ steps:
 
 Note the difference in error handling:
 - `cases.beforeCreate` has `failurePolicy: 'open'` → the caller logs a warning but proceeds
-- `cases.beforeComment` has `failurePolicy: 'closed'` → the caller throws and blocks the operation
+- `cases.beforeComment` has `failurePolicy: 'closed'` → the caller throws on both `'failed'` and `'timeout'`
 
 ### What the Cases team needs to do
 
