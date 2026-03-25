@@ -86,6 +86,7 @@ Teams register custom trigger types via `registerTriggerDefinition()` in their p
 | `05-dashboard-oncreate-byvalue.yaml` | Same, but by-value with `workflow.output` | By-value via outputs | Yes |
 | `06-alert-enrichment.yaml` | Alert enrichment with AI summary | Async event-driven | No |
 | `07-cases-guardrail.yaml` | PII blocking on case comments | `workflow.fail` for blocking | Yes |
+| `08-sync-workflow-guardrails.md` | Guardrails for sync workflows | Timeout, circuit breaker, fail-open | — |
 
 ## Architecture
 
@@ -129,13 +130,25 @@ Teams register custom trigger types via `registerTriggerDefinition()` in their p
   3. Continue immediately                                   4. Workflow runs async via TM
 ```
 
+## Guardrails for Sync Workflows
+
+Sync workflows block HTTP requests. A broken or slow workflow can degrade the experience for all users. See **[`08-sync-workflow-guardrails.md`](./08-sync-workflow-guardrails.md)** for the full proposal, covering:
+
+- Hard timeout enforcement (platform cap + trigger-level cap)
+- Fail-open vs. fail-closed (configurable per trigger)
+- Circuit breaker (auto-disable after repeated failures)
+- Save-time validation (block dangerous patterns)
+- Sync chain depth limits (prevent cascade)
+- Concurrency limits (max sync workflows per trigger)
+- Admin controls and observability
+
 ## Open Questions
 
 1. **Who decides sync vs async?** The proposal puts `sync: true` on the workflow's trigger definition. But what if the emitter wants to control it? (e.g., dashboard team always wants sync for `onCreate` but async for `onView`)
 
-2. **Multiple sync workflows**: If 3 workflows subscribe to `dashboard.onCreate` with `sync: true`, do they run sequentially? In parallel? What if one fails — do the others still run?
+2. **Multiple sync workflows**: If 3 workflows subscribe to `dashboard.onCreate` with `sync: true`, do they run sequentially? In parallel? What if one fails — do the others still run? → See `08-sync-workflow-guardrails.md` §7
 
-3. **Timeouts**: What is the max execution time for a sync workflow? This blocks an HTTP request. Guardrails should be fast (< 5s), but PII reduction with AI could be slower.
+3. **Timeouts**: What is the max execution time for a sync workflow? This blocks an HTTP request. Guardrails should be fast (< 5s), but PII reduction with AI could be slower. → See `08-sync-workflow-guardrails.md` §1–2
 
 4. **By-ref implementation**: How does `event.mutate` actually work under the hood? Does the execution engine pass a mutable reference, or does it merge the mutation result back into the caller's object after completion?
 
