@@ -155,9 +155,7 @@ Sync workflows block HTTP requests. A broken or slow workflow can degrade the ex
 
 5. **By-ref implementation**: How does `event.mutate` actually work under the hood? Does the execution engine pass a mutable reference, or does it merge the mutation result back into the caller's object after completion?
 
-6. **Trigger-implied inputs**: When a workflow subscribes to `dashboard.onCreate`, should the event schema automatically become the workflow's inputs? Or should the workflow author still declare inputs explicitly?
-
-7. **AB migration path**: Agent Builder currently uses a custom loop + `BeforeAgentWorkflowOutput` contract. How do we migrate to the standard model without breaking existing workflows that rely on `abort`/`abort_message`/`new_prompt`?
+6. **AB migration path**: Agent Builder currently uses a custom loop + `BeforeAgentWorkflowOutput` contract. How do we migrate to the standard model without breaking existing workflows that rely on `abort`/`abort_message`/`new_prompt`?
 
 ## Related Files
 
