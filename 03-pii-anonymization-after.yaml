@@ -1,0 +1,77 @@
+# =============================================================================
+# 03 — PII Anonymization: After Inference
+# =============================================================================
+# Use case: Runs after the LLM responds. Retrieves the token-to-original
+#           mapping stored by the before-inference workflow, scans the LLM
+#           response for tokens, and restores the original values before
+#           the user sees the response.
+#
+# Paired with: 02-pii-anonymization-before.yaml (creates the token map)
+#
+# This demonstrates:
+#   - [PROPOSED] trigger type: agent-builder.afterInference
+#   - [PROPOSED] sync: true — blocks until de-anonymization is complete
+#   - [PROPOSED STEP] state.ephemeral.get — retrieves the stored token map
+#   - [PROPOSED STEP] transform.pii_restore — replaces tokens with originals
+#   - [PROPOSED STEP] state.ephemeral.delete — cleans up ephemeral state
+#   - [PROPOSED STEP] event.mutate — rewrites the response the user will see
+# =============================================================================
+
+version: '1'
+name: PII De-anonymization — After Inference
+description: >
+  Post-inference step that retrieves the token-to-original PII mapping
+  for this conversation round and restores real values in the LLM's
+  response before it reaches the user.
+enabled: true
+tags:
+  - anonymization
+  - pii
+  - agent-builder
+
+# --- Trigger ---
+# [PROPOSED] agent-builder.afterInference — fires after the LLM responds.
+# Event schema: { response: string, roundId: string, agentId?: string }
+triggers:
+  - type: agent-builder.afterInference                  # [PROPOSED]
+    sync: true                                           # [PROPOSED]
+
+# --- Steps ---
+steps:
+
+  # Step 1: Retrieve the mapping stashed by the before-inference workflow
+  # [PROPOSED STEP] state.ephemeral.get — reads from the ephemeral store
+  - name: fetch_map
+    type: state.ephemeral.get                            # [PROPOSED STEP]
+    with:
+      key: "pii_map:{{ event.roundId }}"
+
+  # Step 2: If no map was stored (e.g., no PII was found), skip restoration
+  - name: check_map_exists
+    type: if                                             # [EXISTS]
+    condition: "steps.fetch_map.output.value : *"
+    steps:
+
+      # Step 3: Scan the LLM response for tokens and swap originals back in
+      # [PROPOSED STEP] transform.pii_restore — for each key in the token map
+      # found in the response text, replaces the token with the original value
+      - name: deanonymise
+        type: transform.pii_restore                      # [PROPOSED STEP]
+        with:
+          input: "{{ event.response }}"
+          token_map: "{{ steps.fetch_map.output.value }}"
+
+      # Step 4: Rewrite the response the user will actually see
+      # [PROPOSED STEP] event.mutate — modifies event.response in-place (by-ref)
+      - name: rewrite_response
+        type: event.mutate                               # [PROPOSED STEP]
+        with:
+          set:
+            response: "{{ steps.deanonymise.output.restored_text }}"
+
+      # Step 5: Clean up ephemeral state
+      # [PROPOSED STEP] state.ephemeral.delete
+      - name: cleanup
+        type: state.ephemeral.delete                     # [PROPOSED STEP]
+        with:
+          key: "pii_map:{{ event.roundId }}"

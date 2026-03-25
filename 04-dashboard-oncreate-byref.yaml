@@ -1,0 +1,92 @@
+# =============================================================================
+# 04 — Dashboard on-create: By-Ref Pattern
+# =============================================================================
+# Use case: The dashboard team emits an event before persisting a new
+#           dashboard. This workflow runs PII reduction on the title and
+#           description, modifying them in-place (by-ref). The dashboard
+#           team saves the modified object without needing to know the
+#           output contract.
+#
+# Compare with: 05-dashboard-oncreate-byvalue.yaml (same use case, by-value)
+#
+# From the meeting (Shay):
+#   "They decide what object they pass. If they're concerned and they don't
+#    want to pass the full dashboard object, they can pass in a dashboard
+#    event, and then copy things back."
+#
+# This demonstrates:
+#   - [PROPOSED] trigger type: dashboard.onCreate (registered by dashboard team)
+#   - [PROPOSED] sync: true — blocks the create API until workflow completes
+#   - [PROPOSED STEP] event.mutate — modifies the event object by-ref
+#   - [EXISTS] data.regexReplace — regex-based text replacement
+#   - [EXISTS] workflow.fail — rejects the dashboard creation
+#
+# How the dashboard team calls this:
+#   const dashboardEvent = { title: soAttributes.title, description: soAttributes.description };
+#   const result = await workflowsClient.emitEvent('dashboard.onCreate', dashboardEvent);
+#   if (result?.status === 'failed') throw Boom.badRequest(result.error?.message);
+#   soAttributes.title = dashboardEvent.title;             // modified by workflow
+#   soAttributes.description = dashboardEvent.description;
+#   const savedObject = await core.savedObjects.client.create(...);
+# =============================================================================
+
+version: '1'
+name: Dashboard PII Reduction (by-ref)
+description: >
+  Runs before a dashboard is saved. Scans the title and description
+  for PII patterns and replaces them with masked values. Modifies the
+  event object directly so the caller gets the cleaned version back.
+enabled: true
+tags:
+  - pii
+  - dashboard
+
+# --- Trigger ---
+# [PROPOSED] dashboard.onCreate — registered by the dashboard team.
+# Event schema: { title: string, description?: string, tags?: string[] }
+# Note: this is a trimmed-down DTO, NOT the full dashboard saved object.
+triggers:
+  - type: dashboard.onCreate                             # [PROPOSED]
+    sync: true                                            # [PROPOSED]
+
+# --- Steps ---
+steps:
+
+  # Step 1: Redact PII from the title
+  # [EXISTS] data.regexReplace — regex-based replacement, available today
+  - name: redact_title
+    type: data.regexReplace                              # [EXISTS]
+    with:
+      input: "{{ event.title }}"
+      patterns:
+        - pattern: '\b\d{3}-\d{2}-\d{4}\b'
+          replacement: '***-**-****'
+        - pattern: '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+          replacement: '[EMAIL REDACTED]'
+        - pattern: '\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b'
+          replacement: '[CARD REDACTED]'
+
+  # Step 2: Redact PII from the description
+  - name: redact_description
+    type: data.regexReplace                              # [EXISTS]
+    if: "event.description : *"
+    with:
+      input: "{{ event.description }}"
+      patterns:
+        - pattern: '\b\d{3}-\d{2}-\d{4}\b'
+          replacement: '***-**-****'
+        - pattern: '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+          replacement: '[EMAIL REDACTED]'
+        - pattern: '\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b'
+          replacement: '[CARD REDACTED]'
+
+  # Step 3: Write the cleaned values back to the event object (by-ref)
+  # [PROPOSED STEP] event.mutate — the caller's event object is modified directly.
+  # After this, dashboardEvent.title and dashboardEvent.description are the
+  # redacted versions. The dashboard team just uses them as-is.
+  - name: apply_redactions
+    type: event.mutate                                   # [PROPOSED STEP]
+    with:
+      set:
+        title: "{{ steps.redact_title.output }}"
+        description: "{{ steps.redact_description.output | default: event.description }}"

@@ -1,0 +1,93 @@
+# =============================================================================
+# 02 — PII Anonymization: Before Inference
+# =============================================================================
+# Use case: Runs before the LLM sees the user's message. Detects PII,
+#           replaces each value with a deterministic token, stores the
+#           token-to-original mapping in ephemeral state, and rewrites the
+#           message so the LLM never sees real PII.
+#
+# Paired with: 03-pii-anonymization-after.yaml (restores originals in response)
+#
+# This demonstrates:
+#   - [PROPOSED] trigger type: agent-builder.beforeInference
+#   - [PROPOSED] sync: true — blocks until anonymization is complete
+#   - [PROPOSED STEP] ai.pii — detects and replaces PII in text
+#   - [PROPOSED STEP] state.ephemeral.set — stores data for the paired after-workflow
+#   - [PROPOSED STEP] event.mutate — modifies the event object (by-ref)
+#   - [EXISTS] data.set — set workflow variables
+#
+# Key question from the meeting (Shay):
+#   "Do we have a before and after? And how do we maintain state between them?"
+#
+# Answer: Two separate workflows sharing state via ephemeral storage, keyed by
+# a conversation/round ID. The before-workflow writes the mapping, the
+# after-workflow reads it.
+# =============================================================================
+
+version: '1'
+name: PII Anonymization — Before Inference
+description: >
+  Pre-inference guardrail that detects PII in the user message,
+  replaces each value with a deterministic HMAC-SHA256 token,
+  stores the token-to-original mapping in ephemeral state,
+  and rewrites the message the LLM will see.
+enabled: true
+tags:
+  - anonymization
+  - pii
+  - agent-builder
+
+# --- Trigger ---
+# [PROPOSED] agent-builder.beforeInference — fires right before the LLM call.
+# Distinct from chatRound (which fires at the start of the round).
+# Event schema: { message: string, roundId: string, agentId?: string }
+triggers:
+  - type: agent-builder.beforeInference                # [PROPOSED]
+    sync: true                                          # [PROPOSED]
+
+# --- Steps ---
+steps:
+
+  # Step 1: Detect PII and replace in a single pass
+  # [PROPOSED STEP] ai.pii — scans text for PII entities, replaces each with
+  # a deterministic token. Produces:
+  #   - anonymised_text: the message with tokens substituted in
+  #   - token_map: { "<token>": { "original": "...", "entity": "EMAIL_ADDRESS" }, ... }
+  - name: anonymise
+    type: ai.pii                                        # [PROPOSED STEP]
+    with:
+      input: "{{ event.message }}"
+      entities:
+        - EMAIL_ADDRESS
+        - US_SSN
+        - CREDIT_CARD
+        - PHONE_NUMBER
+        - IP_ADDRESS
+        - PERSON_NAME
+      action: replace
+      replace_strategy: hmac_sha256
+      hmac_secret: "{{ consts.pii_hmac_key }}"
+
+  # Step 2: Store the token map so the after-inference workflow can reverse it
+  # [PROPOSED STEP] state.ephemeral.set — writes a key-value pair to a
+  # short-lived store scoped to the current execution context.
+  # The key includes the round ID so multiple rounds don't collide.
+  - name: store_map
+    type: state.ephemeral.set                           # [PROPOSED STEP]
+    with:
+      key: "pii_map:{{ event.roundId }}"
+      value: "{{ steps.anonymise.output.token_map }}"
+      ttl_seconds: 300
+
+  # Step 3: Rewrite the message the LLM will actually see
+  # [PROPOSED STEP] event.mutate — modifies the event object in-place (by-ref).
+  # After this step, the caller's event.message contains the anonymised text.
+  - name: rewrite_message
+    type: event.mutate                                  # [PROPOSED STEP]
+    with:
+      set:
+        message: "{{ steps.anonymise.output.anonymised_text }}"
+
+# --- Constants ---
+consts:
+  pii_hmac_key: "REDACTED"

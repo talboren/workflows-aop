@@ -1,0 +1,125 @@
+# =============================================================================
+# 06 — Alert Enrichment (Async, Event-Driven)
+# =============================================================================
+# Use case: When an alert fires, enrich it with additional context from
+#           Elasticsearch and an AI-generated summary. Write the enrichment
+#           back to the alert or a case. This is async (fire-and-forget) —
+#           the alerting system does not wait for enrichment to complete.
+#
+# This demonstrates:
+#   - [EXISTS] alert trigger — built-in trigger type
+#   - [EXISTS] elasticsearch.search — query ES for context
+#   - [EXISTS] ai.summarize — AI summarization step (extension)
+#   - [EXISTS] kibana.request — call a Kibana API to write back
+#   - [EXISTS] foreach — iterate over alerts
+#   - No sync: true needed — this is a background enrichment job
+# =============================================================================
+
+version: '1'
+name: Alert Enrichment & AI Summary
+description: >
+  Triggered by alerts. For each alert, queries related logs from Elasticsearch,
+  generates an AI summary of the context, and posts the enrichment as a
+  comment to the associated case (or creates one).
+enabled: true
+tags:
+  - enrichment
+  - alert
+  - ai
+
+# --- Trigger ---
+# [EXISTS] alert trigger — fires when an alerting rule matches
+triggers:
+  - type: alert                                          # [EXISTS]
+
+# --- Steps ---
+steps:
+
+  - name: for_each_alert
+    type: foreach                                        # [EXISTS]
+    foreach: "{{ event.alerts }}"
+    steps:
+
+      # Step 1: Get related logs from the past 24h
+      - name: get_related_logs
+        type: elasticsearch.search                       # [EXISTS]
+        with:
+          index: logs-*
+          size: 50
+          query:
+            bool:
+              must:
+                - match:
+                    host.name: "{{ foreach.item._source.host.name }}"
+              filter:
+                - range:
+                    '@timestamp':
+                      gte: "now-24h"
+          sort:
+            - '@timestamp': desc
+
+      # Step 2: Get related alerts from the same host
+      - name: get_related_alerts
+        type: elasticsearch.search                       # [EXISTS]
+        with:
+          index: .alerts-security.alerts-default
+          size: 10
+          query:
+            bool:
+              must:
+                - match:
+                    host.name: "{{ foreach.item._source.host.name }}"
+              filter:
+                - range:
+                    '@timestamp':
+                      gte: "now-7d"
+
+      # Step 3: Generate AI summary of the context
+      - name: ai_summary
+        type: ai.summarize                               # [EXISTS]
+        with:
+          inference_id: ".elser-2"
+          input: |
+            Alert: {{ foreach.item._source.kibana.alert.rule.name }}
+            Severity: {{ foreach.item._source.kibana.alert.severity }}
+            Host: {{ foreach.item._source.host.name }}
+
+            Related logs (last 24h):
+            {{ steps.get_related_logs.output.hits.hits | map: "_source" | json: 2 }}
+
+            Related alerts (last 7d):
+            {{ steps.get_related_alerts.output.hits.hits | map: "_source.kibana.alert.rule.name" | json }}
+          instructions: >
+            Provide a concise investigation summary for a SOC analyst.
+            Highlight any patterns, correlations between the alert and
+            recent logs, and suggest next investigation steps.
+
+      # Step 4: Post enrichment to a Kibana case (or create one)
+      - name: post_to_case
+        type: kibana.request                             # [EXISTS]
+        with:
+          method: POST
+          path: /api/cases
+          body:
+            title: "[Auto-Enrichment] {{ foreach.item._source.kibana.alert.rule.name }} on {{ foreach.item._source.host.name }}"
+            description: |
+              ## AI-Generated Investigation Summary
+
+              {{ steps.ai_summary.output }}
+
+              ## Alert Details
+              - **Rule**: {{ foreach.item._source.kibana.alert.rule.name }}
+              - **Severity**: {{ foreach.item._source.kibana.alert.severity }}
+              - **Host**: {{ foreach.item._source.host.name }}
+              - **Related alerts (7d)**: {{ steps.get_related_alerts.output.hits.total.value }}
+              - **Related log entries (24h)**: {{ steps.get_related_logs.output.hits.total.value }}
+            owner: securitySolution
+            tags:
+              - auto-enrichment
+              - "{{ foreach.item._source.kibana.alert.rule.name }}"
+            severity: medium
+            connector:
+              id: none
+              name: none
+              type: .none
+              fields: null

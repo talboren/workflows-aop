@@ -1,0 +1,97 @@
+# =============================================================================
+# 05 — Dashboard on-create: By-Value Pattern (for comparison)
+# =============================================================================
+# Use case: Same as 04 (PII reduction on dashboard title/description),
+#           but using the by-value pattern with workflow.output instead
+#           of event.mutate.
+#
+# Compare with: 04-dashboard-oncreate-byref.yaml (same use case, by-ref)
+#
+# From the meeting (Shay):
+#   "Can you imagine what that workflow will look like? I don't think it
+#    would be very lovable with the output option." (when discussing 7+ fields)
+#
+# This demonstrates:
+#   - [PROPOSED] trigger type: dashboard.onCreate
+#   - [PROPOSED] sync: true
+#   - [EXISTS] workflow.output — returns modified values as structured output
+#   - [EXISTS] outputs definition — typed output schema
+#   - [EXISTS] data.regexReplace — regex replacement
+#
+# How the dashboard team calls this (note: must know the output contract):
+#   const dashboardEvent = { title: soAttributes.title, description: soAttributes.description };
+#   const result = await workflowsClient.emitEvent('dashboard.onCreate', dashboardEvent);
+#   if (result?.status === 'failed') throw Boom.badRequest(result.error?.message);
+#   if (result?.outputs) {
+#     soAttributes.title = result.outputs.title;              // must copy each field
+#     soAttributes.description = result.outputs.description;  // must copy each field
+#   }
+#   const savedObject = await core.savedObjects.client.create(...);
+#
+# Note: With 2 fields this is manageable. With 7+ fields (Shay's point),
+# the caller ends up with a long list of field assignments, and must stay
+# in sync with any changes to the workflow's output schema.
+# =============================================================================
+
+version: '1'
+name: Dashboard PII Reduction (by-value)
+description: >
+  Runs before a dashboard is saved. Scans the title and description
+  for PII patterns and returns the cleaned values via workflow.output.
+  The caller must copy the output fields back to the dashboard object.
+enabled: true
+tags:
+  - pii
+  - dashboard
+
+# --- Outputs ---
+# [EXISTS] outputs — typed schema for what this workflow returns.
+# The caller must know this schema and copy each field.
+outputs:
+  type: object
+  properties:
+    title:
+      type: string
+    description:
+      type: string
+
+# --- Trigger ---
+triggers:
+  - type: dashboard.onCreate                             # [PROPOSED]
+    sync: true                                            # [PROPOSED]
+
+# --- Steps ---
+steps:
+
+  # Step 1: Redact PII from the title
+  - name: redact_title
+    type: data.regexReplace                              # [EXISTS]
+    with:
+      input: "{{ event.title }}"
+      patterns:
+        - pattern: '\b\d{3}-\d{2}-\d{4}\b'
+          replacement: '***-**-****'
+        - pattern: '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+          replacement: '[EMAIL REDACTED]'
+
+  # Step 2: Redact PII from the description
+  - name: redact_description
+    type: data.regexReplace                              # [EXISTS]
+    if: "event.description : *"
+    with:
+      input: "{{ event.description }}"
+      patterns:
+        - pattern: '\b\d{3}-\d{2}-\d{4}\b'
+          replacement: '***-**-****'
+        - pattern: '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+          replacement: '[EMAIL REDACTED]'
+
+  # Step 3: Return modified values via workflow.output
+  # [EXISTS] workflow.output — the caller reads result.outputs.title, etc.
+  # Note: if we had 7+ fields, we'd need 7+ lines here AND 7+ lines
+  # in the caller to copy them back. This is Shay's "unlovable" concern.
+  - name: return_redacted
+    type: workflow.output                                # [EXISTS]
+    with:
+      title: "{{ steps.redact_title.output }}"
+      description: "{{ steps.redact_description.output | default: event.description }}"

@@ -1,0 +1,80 @@
+# =============================================================================
+# 07 — Cases Comment Guardrail (Sync)
+# =============================================================================
+# Use case: When a user posts a comment on a case, this workflow scans
+#           the comment text for PII and blocks the comment if PII is found.
+#           Demonstrates the same guardrail pattern as 01 (Agent Builder)
+#           but applied to a completely different system (Cases), showing
+#           that the pattern is reusable across Kibana.
+#
+# From the meeting (Shay):
+#   "I want to make sure that I implement the same anonymization service
+#    or anonymization capabilities in cases."
+#
+# This demonstrates:
+#   - [PROPOSED] trigger type: cases.createComment (registered by cases team)
+#   - [PROPOSED] sync: true — blocks the comment creation
+#   - [PROPOSED STEP] ai.guardrail — same step type as in 01, different trigger
+#   - [EXISTS] workflow.fail — rejects the comment with structured error
+#   - Pattern reusability: same step type works for AB rounds and case comments
+# =============================================================================
+
+version: '1'
+name: Case Comment PII Guardrail
+description: >
+  Blocks case comments that contain PII. Scans the comment text for
+  sensitive data patterns (SSN, credit cards, emails, phone numbers)
+  and rejects the comment if any are found.
+enabled: true
+tags:
+  - guardrail
+  - pii
+  - cases
+
+# --- Trigger ---
+# [PROPOSED] cases.createComment — registered by the cases team.
+# Event schema: { caseId: string, comment: string, owner: string }
+# Note: this is just the comment text, not the full case object.
+triggers:
+  - type: cases.createComment                            # [PROPOSED]
+    sync: true                                            # [PROPOSED]
+
+# --- Steps ---
+steps:
+
+  # Step 1: Scan for PII in the comment
+  # [PROPOSED STEP] ai.guardrail — same step type as used in 01-guardrails-sync.yaml
+  # but with only the PII check enabled. This shows the step is reusable
+  # across different systems with different triggers.
+  - name: validate_comment
+    type: ai.guardrail                                   # [PROPOSED STEP]
+    with:
+      input: "{{ event.comment }}"
+      checks:
+        - type: pii
+          config:
+            entities:
+              - EMAIL_ADDRESS
+              - US_SSN
+              - CREDIT_CARD
+              - PHONE_NUMBER
+              - IP_ADDRESS
+            action: block
+
+  # Step 2: Block or allow
+  - name: check_result
+    type: if                                             # [EXISTS]
+    condition: "steps.validate_comment.output.passed : false"
+    steps:
+      - name: block_comment
+        type: workflow.fail                              # [EXISTS]
+        with:
+          message: >
+            Comment blocked: PII detected ({{ steps.validate_comment.output.failed_reason }}).
+            Please remove sensitive information before posting.
+          reason: "pii_detected"
+    else:
+      - name: allow_comment
+        type: workflow.output                            # [EXISTS]
+        with:
+          passed: true

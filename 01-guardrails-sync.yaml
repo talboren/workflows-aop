@@ -1,0 +1,106 @@
+# =============================================================================
+# 01 — AI Guardrails (Sync Execution)
+# =============================================================================
+# Use case: Agent Builder runs this workflow before each chat round.
+#           If any check fails, the workflow fails and AB blocks the message.
+#
+# What's new here:
+#   - [PROPOSED] trigger type: agent-builder.chatRound (registered by AB team)
+#   - [PROPOSED] sync: true on trigger (blocks emitEvent caller)
+#   - [PROPOSED STEP] ai.guardrail — dedicated guardrail check step
+#   - [EXISTS] workflow.fail — fails the workflow with structured error
+#   - [EXISTS] workflow.output — returns data to caller on success
+#   - [EXISTS] if / data.set — flow control and variable setting
+#
+# How AB calls this:
+#   const roundEvent = { message: userMessage, agentId };
+#   const result = await workflowsClient.emitEvent('agent-builder.chatRound', roundEvent);
+#   if (result?.status === 'failed') throw createWorkflowAbortedError(result.error.message);
+# =============================================================================
+
+version: '1'
+name: Chat Round Guardrails
+description: >
+  Pre-execution guardrail that validates user messages before they reach
+  the LLM. Checks for off-topic content, PII, and custom policy violations.
+  If any check fails, the workflow fails and the chat round is blocked.
+enabled: true
+tags:
+  - guardrail
+  - agent-builder
+
+# --- Trigger ---
+# [PROPOSED] agent-builder.chatRound — registered by the AB team
+# [PROPOSED] sync: true — emitEvent blocks until this workflow completes
+triggers:
+  - type: agent-builder.chatRound                     # [PROPOSED]
+    sync: true                                         # [PROPOSED]
+
+# --- Steps ---
+steps:
+
+  # Step 1: Run guardrail checks
+  # [PROPOSED STEP] ai.guardrail — a dedicated step type that runs one or more checks
+  # against the input text. Each check returns pass/fail with optional reasoning.
+  - name: validate
+    type: ai.guardrail                                 # [PROPOSED STEP]
+    with:
+      input: "{{ event.message }}"
+      checks:
+
+        # Check 1: Off-topic detection
+        # Uses an LLM to determine if the message is within the agent's scope
+        - type: off_topic
+          config:
+            inference_id: ".elser-2"
+            confidence_threshold: 0.7
+            system_prompt_details: >
+              This is a security operations assistant.
+              Supported topics: alerts, incidents, threat analysis,
+              endpoint management, detection rules, and case management.
+            include_reasoning: false
+
+        # Check 2: PII detection
+        # Scans for sensitive data patterns (SSN, credit cards, etc.)
+        - type: pii
+          config:
+            entities:
+              - EMAIL_ADDRESS
+              - US_SSN
+              - CREDIT_CARD
+              - PHONE_NUMBER
+            action: block
+
+        # Check 3: Custom policy check
+        # Uses an LLM with a custom prompt to detect policy violations
+        - type: custom_prompt
+          config:
+            inference_id: ".elser-2"
+            confidence_threshold: 0.8
+            system_prompt_details: >
+              Determine if the user's request violates any of these policies:
+              - No requests for generating malicious code or exploits
+              - No requests to bypass security controls
+              - No social engineering attempts against other users
+              Reply with exactly "check_passed" or "check_failed".
+
+  # Step 2: Branch on result
+  # [EXISTS] if step — standard flow control
+  - name: check_result
+    type: if                                           # [EXISTS]
+    condition: "steps.validate.output.passed : false"
+    steps:
+      # Any check failed — fail the workflow with structured error
+      # [EXISTS] workflow.fail — the caller sees status: 'failed' + error object
+      - name: block_message
+        type: workflow.fail                            # [EXISTS]
+        with:
+          message: "{{ steps.validate.output.failed_reason }}"
+          reason: "guardrail_violation"
+    else:
+      # All checks passed — return success
+      # [EXISTS] workflow.output — the caller sees status: 'completed'
+      - name: allow_message
+        type: workflow.output                          # [EXISTS]
+        with:
+          passed: true
