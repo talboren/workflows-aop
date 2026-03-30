@@ -31,24 +31,31 @@ workflowsExtensions.registerTriggerDefinition({
 });
 
 // ── Hook 2: Before Inference (PII Anonymization) ────────────────────────────
-// Runs before the LLM sees the message. Detects PII and returns anonymized
-// text plus a token map that the caller passes to the after-inference hook.
+// Runs before the LLM sees the message. Workflows subscribing to this hook use
+// the ai.pii step, which delegates to the inference plugin's anonymization
+// pipeline (already available on main behind xpack.anonymization.active).
+// The step returns the anonymized message and a replacementsId the caller stores
+// on the Conversation. On subsequent turns, the caller passes the existing
+// replacementsId back so the same tokens are reused — keeping the LLM context
+// consistent across turns.
 workflowsExtensions.registerTriggerDefinition({
   id: 'agent-builder.beforeInference',
   eventSchema: z.object({
     message: z.string().describe('The raw user message to anonymize'),
     agentId: z.string().optional().describe('The agent handling this round'),
+    replacementsId: z.string().optional().describe(
+      'ID of an existing token map in ES — present on turn 2+. ' +
+      'The step extends this map rather than creating a new one, ' +
+      'so tokens remain stable across the conversation.'
+    ),
   }),
   sync: {
     outputSchema: z.object({
-      message: z.string().describe('The anonymized message (tokens substituted for PII)'),
-      tokenMap: z.record(
-        z.string(),
-        z.object({
-          original: z.string(),
-          entity: z.string(),
-        })
-      ).describe('Map of token → { original value, entity type }. Empty object if no PII found.'),
+      message: z.string().describe('The anonymized message with PII replaced by tokens'),
+      replacementsId: z.string().optional().describe(
+        'ID of the token map persisted to ES. ' +
+        'The caller stores this on the Conversation and passes it back on the next turn.'
+      ),
     }),
     maxTimeout: '10s',
     failurePolicy: 'open',        // if anonymization fails, proceed with raw message
@@ -56,20 +63,18 @@ workflowsExtensions.registerTriggerDefinition({
 });
 
 // ── Hook 3: After Inference (PII De-anonymization) ──────────────────────────
-// Runs after the LLM responds. Receives the token map from the before-inference
-// output and restores original PII values in the response.
+// Runs after the LLM responds. Receives the replacementsId from the
+// before-inference output, loads the token map from ES, and restores
+// original PII values in the response.
 workflowsExtensions.registerTriggerDefinition({
   id: 'agent-builder.afterInference',
   eventSchema: z.object({
     response: z.string().describe('The LLM response that may contain PII tokens'),
-    tokenMap: z.record(
-      z.string(),
-      z.object({
-        original: z.string(),
-        entity: z.string(),
-      })
-    ).describe('The token map produced by the before-inference workflow'),
     agentId: z.string().optional(),
+    replacementsId: z.string().optional().describe(
+      'ID of the token map produced by the before-inference hook. ' +
+      'Used to look up original values and restore them in the response.'
+    ),
   }),
   sync: {
     outputSchema: z.object({
@@ -181,10 +186,15 @@ if (result.status === 'failed') {
 version: '1'
 name: PII Anonymization — Before Inference
 description: >
-  Pre-inference hook that detects PII in the user message,
-  replaces each value with a deterministic HMAC-SHA256 token,
-  and returns the anonymized message along with the token map.
-  The caller passes the token map to the after-inference hook.
+  Pre-inference hook that anonymizes the user message before it reaches the LLM.
+  The ai.pii step delegates to the inference plugin's existing anonymization
+  pipeline (PII detection via regex and NER, HMAC-SHA256 token generation,
+  replacements storage via ReplacementsRepository) — the same pipeline that runs
+  automatically inside chatComplete when xpack.anonymization.active is enabled.
+  Exposing it as a workflow step makes the behaviour user-configurable: entity
+  types and tool deanonymization policy live in the YAML rather than being
+  hardcoded. On subsequent turns the existing map is extended so the same entity
+  always maps to the same token, keeping the LLM context stable across turns.
 enabled: true
 tags:
   - anonymization
@@ -200,18 +210,30 @@ outputs:
     message:
       type: string
       description: The anonymized message with PII replaced by tokens
-    tokenMap:
-      type: object
+    replacementsId:
+      type: string
       description: >
-        Map of token to original value and entity type.
-        Example: { "<tok_abc>": { "original": "555-12-3456", "entity": "US_SSN" } }
+        ID of the token map persisted to ES. The caller stores this on the
+        Conversation and passes it back on the next turn.
 
 steps:
-  # [PROPOSED STEP] ai.pii — scans text for PII entities, replaces with HMAC tokens
+  # [PROPOSED STEP] ai.pii — scans the message text for PII, replaces with HMAC
+  # tokens, and always persists the token map to ES via the inference plugin's
+  # ReplacementsRepository (.kibana-anonymization-replacements).
+  # Persistence is unconditional — it is required for multi-turn consistency,
+  # page refresh recovery, distributed execution, and tool deanonymization.
+  # - replacements_id (optional): if present, loads the existing map from ES and
+  #   extends it with any new PII found this turn, so the same entity always maps
+  #   to the same token across the conversation.
+  # - tool_deanonymization: controls whether and how the internal beforeToolCall
+  #   hook is allowed to swap tokens back to real values before a tool executes.
+  #   This is the workflow-configurable surface for tool-level deanonymization —
+  #   the workflow author decides which tools can see real values.
   - name: anonymise
     type: ai.pii                             # [PROPOSED STEP]
     with:
       input: "{{ event.message }}"
+      replacements_id: "{{ event.replacementsId }}"
       entities:
         - EMAIL_ADDRESS
         - US_SSN
@@ -222,13 +244,27 @@ steps:
       action: replace
       replace_strategy: hmac_sha256
       hmac_secret: "{{ consts.pii_hmac_key }}"
+      # tool_deanonymization: governs the internal beforeToolCall hook.
+      # The workflow author decides which tools are trusted to receive real values.
+      # 'allowlist' — only listed tool_ids receive real values; all others see tokens.
+      # 'all'       — every tool call is deanonymized.
+      # 'none'      — tool deanonymization is disabled entirely.
+      #
+      # Example: a risk score lookup needs the real entity name to query correctly.
+      # A summarization tool does not — it can work with tokens.
+      tool_deanonymization:
+        mode: allowlist
+        tool_ids:
+          - 'security.entity_analytics.risk_score'
 
-  # Return both the anonymized text and the token map
+  # Return the anonymized message and the ES token map ID.
+  # The caller stores replacementsId on the Conversation and threads it into
+  # agentRunner.run() so beforeToolCall / afterToolCall hooks can access it.
   - name: return_result
     type: workflow.output                    # [EXISTS]
     with:
       message: "{{ steps.anonymise.output.anonymised_text }}"
-      tokenMap: "{{ steps.anonymise.output.token_map }}"
+      replacementsId: "{{ steps.anonymise.output.replacements_id }}"
 
 consts:
   pii_hmac_key: "REDACTED"
@@ -242,9 +278,9 @@ consts:
 version: '1'
 name: PII De-anonymization — After Inference
 description: >
-  Post-inference hook that restores original PII values in the LLM's
-  response using the token map provided by the caller. The token map
-  is passed as input — no shared state needed.
+  Post-inference hook that restores original PII values in the LLM's response.
+  Receives the replacementsId from the before-inference output, loads the token
+  map from ES, and replaces all tokens in the response with their originals.
 enabled: true
 tags:
   - anonymization
@@ -262,16 +298,17 @@ outputs:
       description: The response with original PII values restored
 
 steps:
-  - name: check_has_tokens
+  - name: check_has_replacements
     type: if                                 # [EXISTS]
-    condition: "event.tokenMap : *"
+    condition: "event.replacementsId : *"
     steps:
-      # [PROPOSED STEP] transform.pii_restore — scans for tokens and replaces with originals
+      # [PROPOSED STEP] transform.pii_restore — loads token map from ES by replacementsId,
+      # scans for tokens in the response, and replaces them with originals.
       - name: deanonymise
         type: transform.pii_restore          # [PROPOSED STEP]
         with:
           input: "{{ event.response }}"
-          token_map: "{{ event.tokenMap }}"
+          replacements_id: "{{ event.replacementsId }}"
 
       - name: return_restored
         type: workflow.output                # [EXISTS]
@@ -286,9 +323,14 @@ steps:
 
 ---
 
-## Caller Code: Trigger Output Chaining
+## Caller Code: Multi-turn Token Map Threading
 
-The PII anonymization and de-anonymization hooks are connected via **trigger output chaining** — the before-hook returns the token map as output, the caller holds it in memory, and passes it as input to the after-hook.
+The PII anonymization flow uses `replacementsId` to thread the token map across the request lifecycle. The `replacementsId` is:
+
+1. Passed **into** `beforeInference` if an existing map exists (turn 2+)
+2. Returned **from** `beforeInference` and stored on the `Conversation`
+3. Passed **into** `afterInference` for response de-anonymization
+4. Available to **internal tool hooks** (`beforeToolCall`/`afterToolCall`) for mid-turn token swap
 
 ```typescript
 // x-pack/platform/plugins/shared/agent_builder/server/services/agents/run_inference.ts
@@ -296,33 +338,51 @@ The PII anonymization and de-anonymization hooks are connected via **trigger out
 export async function runInferenceWithPiiProtection({
   prompt,
   agentId,
+  conversationId,
+  existingReplacementsId,   // loaded from Conversation before this call
   workflowsClient,
+  conversationStore,
   llm,
   logger,
 }: RunInferenceParams) {
   // ── Phase 1: Anonymize ─────────────────────────────────────────────────
+  // Pass the existing replacementsId if this is a follow-up turn.
+  // The step extends the existing map so tokens remain stable across turns.
   const anonResult = await workflowsClient.invokeHook('agent-builder.beforeInference', {
     message: prompt,
     agentId,
+    replacementsId: existingReplacementsId,
   });
 
   // failurePolicy: 'open' → if anonymization fails, proceed with original
   const anonymizedPrompt = anonResult.output?.message ?? prompt;
-  const tokenMap = anonResult.output?.tokenMap ?? {};
+  const replacementsId = anonResult.output?.replacementsId ?? existingReplacementsId;
 
   if (anonResult.status === 'failed') {
     logger.warn(`PII anonymization failed (proceeding with original): ${anonResult.error?.message}`);
   }
 
-  // ── Phase 2: Run inference with the anonymized prompt ──────────────────
-  const llmResponse = await llm.inference(anonymizedPrompt);
+  // Persist replacementsId on Conversation so the next turn can load it back.
+  if (replacementsId && replacementsId !== existingReplacementsId && conversationId) {
+    await conversationStore.updateReplacementsId(conversationId, replacementsId);
+  }
+
+  // ── Phase 2: Run inference ─────────────────────────────────────────────
+  // replacementsId is threaded into the agent runner so internal tool hooks
+  // (beforeToolCall / afterToolCall) can deanonymize params and re-anonymize
+  // results mid-turn without going through the workflow engine.
+  const llmResponse = await agentRunner.run({
+    message: anonymizedPrompt,
+    replacementsId,
+  });
 
   // ── Phase 3: De-anonymize ──────────────────────────────────────────────
-  // Token map flows through the caller — no shared state needed
+  // The after-inference hook loads the token map from ES using replacementsId
+  // and restores original values in the response.
   const deanonResult = await workflowsClient.invokeHook('agent-builder.afterInference', {
     response: llmResponse,
-    tokenMap,
     agentId,
+    replacementsId,
   });
 
   const restoredResponse = deanonResult.output?.response ?? llmResponse;
@@ -335,35 +395,89 @@ export async function runInferenceWithPiiProtection({
 }
 ```
 
-### Data Flow
+### Data Flow (multi-turn)
 
 ```
-  Agent Builder (caller)                    Workflow Engine
-  ======================                    ==============
+  Turn 1                                    Turn 2
+  ──────                                    ──────
+  conversation.replacementsId = undefined   conversation.replacementsId = "repl-abc-123"
+       │                                         │
+       ▼                                         ▼
+  invokeHook('beforeInference',            invokeHook('beforeInference',
+    { message, replacementsId: undefined })  { message, replacementsId: "repl-abc-123" })
+       │                                         │
+       │  ai.pii step:                           │  ai.pii step:
+       │  → creates new token map                │  → loads existing map "repl-abc-123"
+       │  → writes to ES                         │  → extends it with any new PII
+       │  → returns replacementsId: "repl-abc-123" → returns same replacementsId
+       │                                         │
+       ▼                                         ▼
+  store "repl-abc-123" on Conversation      same "repl-abc-123" — no update needed
+       │                                         │
+       ▼                                         ▼
+  llm.inference(anonymizedPrompt)           llm.inference(anonymizedPrompt)
+  — tool hooks use "repl-abc-123"           — same token map, tokens are consistent
+       │                                         │
+       ▼                                         ▼
+  invokeHook('afterInference',             invokeHook('afterInference',
+    { response, replacementsId: "repl-abc-123" }) { response, replacementsId: "repl-abc-123" })
+```
 
-  1. User sends: "Call me at 555-12-3456"
-     │
-     ├── invokeHook('beforeInference',  ──→  Anonymize workflow:
-     │     { message: "Call me at              1. ai.pii detects US_SSN
-     │       555-12-3456" })                   2. Replaces → "Call me at <tok_abc>"
-     │                                         3. workflow.output:
-     │   ◄── HookResult ──────────────────        { message: "Call me at <tok_abc>",
-     │       output: { message, tokenMap }          tokenMap: { "<tok_abc>":
-     │                                                { original: "555-12-3456",
-     │  tokenMap held in caller's memory              entity: "US_SSN" } } }
-     │
-     ├── llm.inference("Call me at <tok_abc>")
-     │   ◄── "Sure, I'll call <tok_abc>"
-     │
-     ├── invokeHook('afterInference',   ──→  De-anonymize workflow:
-     │     { response: "Sure, I'll call        1. Checks tokenMap is not empty
-     │       <tok_abc>",                       2. transform.pii_restore replaces tokens
-     │       tokenMap: { ... } })              3. workflow.output:
-     │                                            { response: "Sure, I'll call 555-12-3456" }
-     │   ◄── HookResult ──────────────────
-     │       output: { response }
-     │
-     └── Return to user: "Sure, I'll call 555-12-3456"
+---
+
+## Tool Lifecycle Hooks
+
+`beforeToolCall` and `afterToolCall` are **internal Agent Builder extension points** — not workflow triggers. See [README section 9](./README.md#9-internal-tool-hooks-beforetoolcall--aftertoolcall) for the rationale (latency, allowlist policy, always-re-anonymize guarantee).
+
+Any Agent Builder feature can register into these hooks via `registerToolLifecycleHooks`. The `tool_deanonymization` block declared in the `beforeInference` workflow YAML (see above) is passed through as `toolDeanonymizationPolicy` on every `beforeToolCall` invocation.
+
+```typescript
+// [PROPOSED] Internal Agent Builder registration API
+
+agentBuilder.registerToolLifecycleHooks({
+  beforeToolCall: async ({ toolId, toolParams, replacementsId, toolDeanonymizationPolicy }) => {
+    if (!replacementsId) return;
+
+    // Only deanonymize if this tool is in the allowlist.
+    // Tools not listed keep receiving tokens — they never see real values.
+    if (!isToolAllowed(toolId, toolDeanonymizationPolicy)) return;
+
+    const tokenToOriginalMap = await inference.getTokenToOriginalMap(replacementsId);
+    return {
+      toolParams: deanonymizeToolParams(toolParams, tokenToOriginalMap),
+    };
+  },
+
+  afterToolCall: async ({ toolReturn, replacementsId }) => {
+    if (!replacementsId) return;
+
+    // Always re-anonymize results regardless of allowlist — the LLM context
+    // must never contain real values, even if the tool needed them to execute.
+    const tokenToOriginalMap = await inference.getTokenToOriginalMap(replacementsId);
+    return {
+      toolReturn: reanonymizeToolReturn(toolReturn, tokenToOriginalMap),
+    };
+  },
+});
+```
+
+`replacementsId` is returned by `beforeInference` and threaded through `agentRunner.run()` as a request-scoped value so every tool hook invocation receives it automatically:
+
+```
+beforeInference output
+  └── replacementsId: "repl-abc-123"
+        │
+        ├── stored on Conversation (for next turn)
+        │
+        └── passed to agentRunner.run({ replacementsId })
+              │
+              ├── beforeToolCall({ toolId, toolParams, replacementsId })
+              │   → fetch token map → deanonymize params
+              │
+              ├── tool executes against real data
+              │
+              └── afterToolCall({ toolReturn, replacementsId })
+                  → re-anonymize results
 ```
 
 ---
@@ -379,55 +493,20 @@ Agent Builder currently uses a custom loop over workflow IDs with a bespoke `Bef
 | `BeforeAgentWorkflowOutput.new_prompt` | Before-inference hook returns `{ message: modifiedPrompt }` via `workflow.output` |
 | `executeWorkflow({ waitForCompletion: true })` per workflow | `invokeHook()` handles execution + result collection |
 | Custom output parsing with `normalizeWorkflowOutput` | Typed `HookResult` with `output` matching `outputSchema` |
+| `replacementsId` managed ad-hoc | `replacementsId` is part of the `beforeInference` hook contract — threaded explicitly |
 
 The new model eliminates the per-team loop, the ad-hoc contract, and the manual workflow ID management. Workflows subscribe via triggers — the engine handles resolution and execution.
 
 ---
 
-## Open Question: State Sharing Between Before/After Hooks
+## Multi-turn Token Map Persistence
 
-The PII anonymization flow requires passing state (the token map) from the before-inference hook to the after-inference hook. Two approaches have been considered:
+Persistence is unconditional — see [README section 8](./README.md#8-multi-turn-state-replacementsid) for the full rationale (multi-turn consistency, page refresh, session restore, distributed execution, tool hook access).
 
-### Alternative A: Trigger Output Chaining (recommended)
+**The `ai.pii` step handles persistence via the inference plugin's `ReplacementsRepository`:**
+- Input: optional `replacements_id` (from previous turns)
+- If present: loads the existing map from `.kibana-anonymization-replacements` and merges new tokens into it
+- If absent: creates a new map in the same index
+- Always: writes the updated map and returns the `replacements_id`
 
-The before-hook returns the token map as output. The caller holds it in local memory and passes it as input to the after-hook. No shared state, no new infrastructure.
-
-```
-Before-inference workflow                 Caller                  After-inference workflow
-========================                  ======                  =========================
-1. Detect PII                             │                       
-2. Replace with tokens                    │                       
-3. workflow.output:                       │                       
-   { message, tokenMap }  ──────────────→ holds tokenMap ───────→ receives tokenMap as event input
-                                          │                       1. Scan response for tokens
-                                          │                       2. Replace tokens with originals
-                                          │                       3. workflow.output: { response }
-```
-
-### Alternative B: Ephemeral State
-
-The before-hook writes to `state.ephemeral.set`, the after-hook reads via `state.ephemeral.get`. The two workflows are coupled via a shared key convention.
-
-```
-Before-inference workflow                                         After-inference workflow
-========================                                          =========================
-1. Detect PII                                                     
-2. Replace with tokens                                            
-3. state.ephemeral.set("pii_map:roundId", tokenMap)               1. state.ephemeral.get("pii_map:roundId")
-4. workflow.output: { message }                                   2. Scan response for tokens
-                                                                  3. Replace tokens with originals
-                                                                  4. state.ephemeral.delete("pii_map:roundId")
-                                                                  5. workflow.output: { response }
-```
-
-### Comparison
-
-| Concern | Trigger output chaining (A) | Ephemeral state (B) |
-|---------|----------------------------|---------------------|
-| **Security** | Token map only exists in the caller's local memory and in each workflow's execution context | Any workflow can call `state.ephemeral.get("pii_map:<guessable-round-id>")` and read the PII mapping |
-| **Coupling** | Each workflow is fully self-contained — inputs in, outputs out | Two workflows coupled via shared key convention (`"pii_map:{{ event.roundId }}"`) |
-| **New infrastructure** | Uses only `workflow.output` — exists today | Requires `state.ephemeral.set/get/delete` — a new storage subsystem |
-| **Testability** | Each workflow independently testable with mock inputs | Hard to test in isolation — depends on ephemeral state being set |
-| **Observability** | Token map is part of the workflow output — visible in execution history | Token map hidden in ephemeral state — not visible in execution logs |
-| **Cleanup** | Nothing to clean up — no persistent state | Must explicitly delete ephemeral state (what if the after-workflow fails?) |
-| **Parallel safety** | No shared state — no collision possible | Key collision risk if round IDs are reused or predictable |
+This is **internal to the step** — the workflow engine is agnostic to it. From the engine's perspective, `replacementsId` is just another string field in the hook's output.
