@@ -43,7 +43,6 @@ workflowsExtensions.registerTriggerDefinition({
   eventSchema: z.object({
     message: z.string().describe('The raw user message to anonymize'),
     agentId: z.string().optional().describe('The agent handling this round'),
-    conversationId: z.string().optional().describe('Conversation ID for logging and context'),
     replacementsId: z.string().optional().describe(
       'ID of an existing token map in ES — present on turn 2+. ' +
       'The step extends this map rather than creating a new one, ' +
@@ -352,7 +351,6 @@ export async function runInferenceWithPiiProtection({
   const anonResult = await workflowsClient.invokeHook('agent-builder.beforeInference', {
     message: prompt,
     agentId,
-    conversationId,
     replacementsId: existingReplacementsId,
   });
 
